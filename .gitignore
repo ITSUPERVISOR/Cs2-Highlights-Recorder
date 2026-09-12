@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# Node / Electron
+node_modules/
+out/
+dist-electron/
+release/
+*.log
+
+# App local data
+.cs2-reel/
+*.dem
+*.dem.gz
+*.dem.zst
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.mdmp

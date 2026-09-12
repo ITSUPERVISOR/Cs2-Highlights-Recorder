@@ -1,0 +1,6 @@
+CS2 weapon icons (SVG) are Valve panorama equipment assets,
+extracted and mirrored by https://github.com/Juknum/counter-strike-icons
+(from Counter-Strike 2 game files).
+
+Counter-Strike and related marks are trademarks of Valve Corporation.
+Not affiliated with or endorsed by Valve.

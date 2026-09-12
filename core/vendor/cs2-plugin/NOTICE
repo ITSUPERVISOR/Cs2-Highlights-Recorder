@@ -1,0 +1,11 @@
+server.dll is the CS2 server plugin from CS Demo Manager
+https://github.com/akiver/cs-demo-manager (cs2-server-plugin/), MIT License.
+
+Copyright (c) Anthony Killer (akiver)
+
+Reel downloads this binary from the live GitHub tree
+(static/cs2/server.dll on main) via `reel-core update-tools`.
+The plugin executes console commands at specific demo ticks, driven by a
+<demo>.json actions file, and is loaded via a temporary gameinfo.gi search path.
+
+Do not join VAC-secured servers while the plugin / HLAE is loaded (-insecure).
