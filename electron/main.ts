@@ -1,13 +1,21 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron";
-import { existsSync, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, net, protocol, shell } from "electron";
+import { existsSync, mkdirSync, readFileSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import initSqlJs, { type Database } from "sql.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "../..");
+const PREVIEW_IPC_MAX = 32 * 1024 * 1024;
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "reelmap",
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true },
+  },
+]);
 
 type Settings = {
   steamId: string;
@@ -147,6 +155,21 @@ function parseJsonOutput(stdout: string) {
   return JSON.parse(stdout.slice(start, end + 1));
 }
 
+function reelHome() {
+  return resolve(process.env.CS2_REEL_HOME || join(process.env.LOCALAPPDATA || homedir(), "cs2-reel"));
+}
+
+function isUnderReelHome(filePath: string) {
+  const root = reelHome();
+  const resolved = resolve(filePath);
+  if (process.platform === "win32") {
+    const a = resolved.toLowerCase();
+    const b = root.toLowerCase();
+    return a === b || a.startsWith(`${b}\\`);
+  }
+  return resolved === root || resolved.startsWith(`${root}${sep}`);
+}
+
 function normalizeDemoPath(filePath: string) {
   return filePath.replace(/\\/g, "/").toLowerCase();
 }
@@ -258,18 +281,48 @@ function createWindow() {
       sandbox: false,
     },
   });
+  mainWindow.webContents.on("did-fail-load", (_e, code, desc, url) => {
+    console.error("Renderer failed to load", code, desc, url);
+  });
+  mainWindow.webContents.on("render-process-gone", (_e, details) => {
+    console.error("Renderer crashed", details.reason, details.exitCode);
+  });
+  mainWindow.webContents.on("unresponsive", () => {
+    console.error("Renderer unresponsive");
+  });
+  mainWindow.webContents.on("console-message", (event) => {
+    const level = event.level;
+    if (level !== "warning" && level !== "error") return;
+    const tag = level === "error" ? "error" : "warn";
+    console.error(`[renderer ${tag}] ${event.message} (${event.sourceId}:${event.lineNumber})`);
+  });
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.webContents.openDevTools({ mode: "detach" });
-    mainWindow.webContents.on("did-fail-load", (_e, code, desc, url) => {
-      console.error("Renderer failed to load", code, desc, url);
-    });
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
     mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
   }
 }
 
+process.on("uncaughtException", (err) => {
+  console.error("uncaughtException", err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("unhandledRejection", err);
+});
+
 app.whenReady().then(async () => {
+  protocol.handle("reelmap", (request) => {
+    try {
+      const filePath = decodeURIComponent(new URL(request.url).searchParams.get("path") || "");
+      if (!filePath || !isUnderReelHome(filePath) || !existsSync(filePath)) {
+        return new Response("not found", { status: 404 });
+      }
+      return net.fetch(pathToFileURL(filePath).href);
+    } catch {
+      return new Response("bad request", { status: 400 });
+    }
+  });
   const SQL = await initSqlJs({
     locateFile: (file: string) => join(ROOT, "node_modules", "sql.js", "dist", file),
   });
@@ -408,6 +461,69 @@ app.whenReady().then(async () => {
     db.run("DELETE FROM queue");
     persistDb();
     return [];
+  });
+
+  ipcMain.handle("preview:readFile", (_e, filePath: string) => {
+    if (typeof filePath !== "string") return null;
+    const resolved = resolve(filePath);
+    if (!isUnderReelHome(resolved) || !existsSync(resolved)) return null;
+    if (statSync(resolved).size > PREVIEW_IPC_MAX) return null;
+    return readFileSync(resolved);
+  });
+  ipcMain.handle(
+    "core:previewClip",
+    async (
+      _e,
+      demoPath: string,
+      startTick: number,
+      endTick: number,
+      steamid: string,
+      mapName?: string,
+      tickrate?: number,
+    ) => {
+      const args = [
+        "preview",
+        demoPath,
+        "--start",
+        String(startTick),
+        "--end",
+        String(endTick),
+        "--player",
+        steamid,
+        "--json",
+      ];
+      if (mapName) args.push("--map-name", mapName);
+      if (tickrate) args.push("--tickrate", String(tickrate));
+      const result = await runCore(args, 300_000);
+      if (result.code !== 0 && !result.stdout.includes("{")) {
+        throw new Error(result.stderr || result.stdout || "preview failed");
+      }
+      const meta = parseJsonOutput(result.stdout || result.stderr);
+      const cachePath = String(meta.cachePath || "");
+      if (!cachePath || !existsSync(cachePath)) {
+        throw new Error(result.stderr || "preview produced no pose cache");
+      }
+      return JSON.parse(readFileSync(cachePath, "utf8"));
+    },
+  );
+  ipcMain.handle("core:previewMap", async (_e, mapName: string) => {
+    const result = await runCore(["preview-map", String(mapName || ""), "--json"], 600_000);
+    if (result.code !== 0 && !result.stdout.includes("{")) {
+      throw new Error(result.stderr || result.stdout || "map export failed");
+    }
+    return parseJsonOutput(result.stdout || result.stderr);
+  });
+
+  // The spec goes via a file: the animation list is dozens of long paths, which
+  // would be at risk of the command-line length limit.
+  ipcMain.handle("core:previewAssets", async (_e, spec: unknown) => {
+    const specPath = join(app.getPath("temp"), "reel-assets-spec.json");
+    writeFileSync(specPath, JSON.stringify(spec ?? {}));
+    const result = await runCore(["preview-assets", "--spec", specPath, "--json"], 900_000);
+    if (result.code !== 0 && !result.stdout.includes("{")) {
+      throw new Error(result.stderr || result.stdout || "asset export failed");
+    }
+    return parseJsonOutput(result.stdout || result.stderr);
   });
 
   ipcMain.handle("core:watch", async (_e, demoPath: string, tick: number, steamid?: string) => {

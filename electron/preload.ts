@@ -21,6 +21,17 @@ const api = {
   addToQueue: (matchId: string, moment: unknown) => ipcRenderer.invoke("queue:add", matchId, moment),
   removeFromQueue: (id: string) => ipcRenderer.invoke("queue:remove", id),
   clearQueue: () => ipcRenderer.invoke("queue:clear"),
+  previewClip: (
+    demoPath: string,
+    startTick: number,
+    endTick: number,
+    steamid: string,
+    mapName?: string,
+    tickrate?: number,
+  ) => ipcRenderer.invoke("core:previewClip", demoPath, startTick, endTick, steamid, mapName, tickrate),
+  readPreviewFile: (path: string) => ipcRenderer.invoke("preview:readFile", path),
+  previewMap: (mapName: string) => ipcRenderer.invoke("core:previewMap", mapName),
+  previewAssets: (spec: unknown) => ipcRenderer.invoke("core:previewAssets", spec),
   watch: (demoPath: string, tick: number, steamid?: string) =>
     ipcRenderer.invoke("core:watch", demoPath, tick, steamid),
   recordQueue: () => ipcRenderer.invoke("core:record"),

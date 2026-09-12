@@ -204,6 +204,15 @@ def doctor(as_json: bool) -> None:
         action=None if plugin_dll else "install",
     )
 
+    s2v = toolchain.find_source2viewer()
+    add(
+        "Source2Viewer CLI",
+        True if s2v else None,
+        str(s2v or "missing — Preview will install this on first map export"),
+        impact="" if s2v else "Until then Preview uses a fallback floor instead of the CS2 map mesh",
+        action=None if s2v else "install",
+    )
+
     if cs2_folder is not None:
         from reel_core.recording.plugin import gameinfo_status
 
@@ -296,12 +305,18 @@ def update_tools(as_json: bool) -> None:
     hlae = toolchain.install_hlae()
     ffmpeg = toolchain.install_ffmpeg()
     plugin = toolchain.install_plugin_dll()
+    try:
+        source2viewer = toolchain.install_source2viewer()
+    except Exception as exc:
+        source2viewer = None
+        info(f"Source2Viewer-CLI skipped: {exc}")
     toolchain.write_ffmpeg_ini(hlae, ffmpeg)
     payload = {
         "ok": True,
         "hlae": str(hlae),
         "ffmpeg": str(ffmpeg),
         "plugin": str(plugin) if plugin else None,
+        "source2viewer": str(source2viewer) if source2viewer else None,
     }
     if as_json:
         click.echo(json.dumps(payload, indent=2))
@@ -465,6 +480,103 @@ def record(demo: Path, moments_file: Path, out_dir: Path, player: str | None, as
         click.echo(json.dumps(payload, indent=2))
     else:
         info(f"Recorded {len(clips)} clip(s) to {out_dir}")
+
+
+@main.command()
+@click.argument("demo", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--start", "start_tick", type=int, required=True)
+@click.option("--end", "end_tick", type=int, required=True)
+@click.option("--player", required=True, help="SteamID64 POV")
+@click.option("--map-name", default="")
+@click.option("--tickrate", type=float, default=0.0)
+@click.option("--json", "as_json", is_flag=True)
+def preview(
+    demo: Path,
+    start_tick: int,
+    end_tick: int,
+    player: str,
+    map_name: str,
+    tickrate: float,
+    as_json: bool,
+) -> None:
+    """Dump clip poses for the in-app 3D Preview tab (does not launch CS2)."""
+    from reel_core.demo.parser import DEFAULT_TICKRATE
+    from reel_core.demo.trajectory import dump_clip_trajectory
+
+    payload = dump_clip_trajectory(
+        demo,
+        start_tick=start_tick,
+        end_tick=end_tick,
+        pov_steamid=player,
+        map_name=map_name,
+        tickrate=tickrate or DEFAULT_TICKRATE,
+    )
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "ok": True,
+                    "cachePath": payload["cachePath"],
+                    "map": payload["map"],
+                    "frames": len(payload["frames"]),
+                    "mapSource": payload["mapSource"],
+                }
+            )
+        )
+        return
+    info(
+        f"Preview {payload['map']}  {len(payload['frames'])} frames  "
+        f"map={payload['mapSource']}  pov={payload['povSteamid']}"
+    )
+
+
+@main.command(name="preview-map")
+@click.argument("map_name")
+@click.option("--json", "as_json", is_flag=True)
+def preview_map(map_name: str, as_json: bool) -> None:
+    """Export a local CS2 map mesh for Preview (Source2Viewer CLI, cached)."""
+    from reel_core.demo.map_assets import export_map_gltf
+
+    path, source = export_map_gltf(map_name)
+    payload = {
+        "ok": True,
+        "map": map_name,
+        "mapGltf": str(path) if path else None,
+        "mapSource": source,
+    }
+    if as_json:
+        click.echo(json.dumps(payload))
+        return
+    info(f"Map {map_name}  source={source}  {path}")
+
+
+@main.command(name="preview-assets")
+@click.option("--spec", "spec_path", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--json", "as_json", is_flag=True)
+def preview_assets(spec_path: str, as_json: bool) -> None:
+    """Export local CS2 weapon and agent models for Preview (cached).
+
+    The spec is read from a file rather than the command line because the
+    animation list runs to dozens of long paths. It is built by the renderer,
+    which owns the weapon table and therefore the animation names.
+    """
+    from reel_core.demo.game_assets import export_assets
+
+    try:
+        spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        payload = {"ok": False, "error": f"unreadable spec: {exc}"}
+    else:
+        payload = export_assets(spec if isinstance(spec, dict) else {})
+
+    if as_json:
+        click.echo(json.dumps(payload))
+        return
+    info(
+        f"Assets  weapons={len(payload.get('weapons') or {})}  "
+        f"agents={len(payload.get('agents') or {})}  "
+        f"missing={payload.get('weaponsMissing') or []}"
+    )
 
 
 def _sequences_from_payload(items: list[dict], demo: DemoData, player_steamid: str | None) -> list[Sequence]:

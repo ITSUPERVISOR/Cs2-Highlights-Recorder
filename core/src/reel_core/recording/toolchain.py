@@ -28,6 +28,7 @@ FFMPEG_DOWNLOAD_URL = (
 CSDM_PLUGIN_URL = (
     "https://raw.githubusercontent.com/akiver/cs-demo-manager/main/static/cs2/server.dll"
 )
+S2V_RELEASES_API = "https://api.github.com/repos/ValveResourceFormat/ValveResourceFormat/releases/latest"
 
 VENDOR_PLUGIN_PATH = Path(__file__).resolve().parents[3] / "vendor" / "cs2-plugin" / "server.dll"
 CACHED_PLUGIN_PATH = lambda: tools_dir() / "plugin" / "server.dll"
@@ -263,3 +264,75 @@ def write_ffmpeg_ini(hlae_exe: Path, ffmpeg_exe: Path) -> None:
     ini_dir = hlae_exe.parent / "ffmpeg"
     ini_dir.mkdir(parents=True, exist_ok=True)
     (ini_dir / "ffmpeg.ini").write_text(f"[Ffmpeg]\nPath={ffmpeg_exe}", encoding="utf-8")
+
+
+def find_source2viewer() -> Path | None:
+    names = ("Source2Viewer-CLI.exe", "Source2Viewer-CLI")
+    for folder in (
+        tools_dir() / "source2viewer",
+        Path.home() / "AppData" / "Local" / "cs2-reel" / "tools" / "source2viewer",
+    ):
+        for name in names:
+            exe = folder / name
+            if exe.is_file():
+                return exe
+            nested = list(folder.glob(f"**/{name}")) if folder.is_dir() else []
+            if nested:
+                return nested[0]
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    extras = (
+        Path.home() / "Source2Viewer" / "Source2Viewer-CLI.exe",
+        Path.home() / "AppData" / "Local" / "Programs" / "Source 2 Viewer" / "Source2Viewer-CLI.exe",
+        Path.home() / "AppData" / "Local" / "Programs" / "Source2Viewer" / "Source2Viewer-CLI.exe",
+    )
+    for path in extras:
+        if path.is_file():
+            return path
+    return None
+
+
+def install_source2viewer() -> Path:
+    """Download Source2Viewer-CLI (MIT) for Preview map/mesh export. Not shipped in git."""
+    existing = find_source2viewer()
+    dest_dir = tools_dir() / "source2viewer"
+    if existing is not None and existing.is_file() and dest_dir in existing.parents:
+        return existing
+
+    info("Downloading Source2Viewer-CLI from GitHub releases...")
+    release = requests.get(S2V_RELEASES_API, timeout=60, headers={"User-Agent": "cs2-reel"}).json()
+    if not isinstance(release, dict):
+        raise RuntimeError(f"Unexpected Source2Viewer releases payload: {release}")
+    asset_url = None
+    for asset in release.get("assets", []):
+        if str(asset.get("name", "")).lower() == "cli-windows-x64.zip":
+            asset_url = asset.get("browser_download_url")
+            break
+    if not asset_url:
+        raise RuntimeError("Could not find cli-windows-x64.zip on the Source2Viewer release")
+
+    zip_path = tools_dir() / "source2viewer.zip"
+    _download(asset_url, zip_path)
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    dest_dir.mkdir(parents=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(dest_dir)
+    zip_path.unlink(missing_ok=True)
+
+    exe = dest_dir / "Source2Viewer-CLI.exe"
+    if not exe.is_file():
+        candidates = list(dest_dir.glob("**/Source2Viewer-CLI.exe")) + list(dest_dir.glob("**/Source2Viewer-CLI"))
+        if not candidates:
+            raise RuntimeError(f"Source2Viewer-CLI.exe not found after extracting to {dest_dir}")
+        exe = candidates[0]
+    (dest_dir / "NOTICE").write_text(
+        "Source2Viewer-CLI is from ValveResourceFormat (MIT License).\n"
+        "https://github.com/ValveResourceFormat/ValveResourceFormat\n"
+        "Used only to export meshes from the local CS2 install. Valve assets are not committed.\n",
+        encoding="utf-8",
+    )
+    info(f"Source2Viewer-CLI installed: {exe} ({release.get('tag_name', '?')})")
+    return exe

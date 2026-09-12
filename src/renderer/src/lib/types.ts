@@ -99,6 +99,8 @@ export type QueueItem = {
   addedAt: number;
 };
 
+export type { PreviewDump, PreviewPose } from "./clipPlayback";
+
 export type DoctorCheck = {
   name: string;
   ok: boolean | null;

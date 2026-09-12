@@ -1,17 +1,19 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { DoctorPage } from "./pages/Doctor";
 import { LibraryPage } from "./pages/Library";
 import { MatchPage } from "./pages/Match";
+import { PreviewPage } from "./pages/Preview";
 import { QueuePage } from "./pages/Queue";
 import { SettingsPage } from "./pages/Settings";
 import { StatsPage } from "./pages/Stats";
 import type { MatchRow } from "./lib/types";
 
-type Tab = "library" | "queue" | "stats" | "doctor" | "settings";
+type Tab = "library" | "queue" | "preview" | "stats" | "doctor" | "settings";
 
 const NAV: { id: Tab; label: string; icon: string }[] = [
   { id: "library", label: "Library", icon: "▦" },
   { id: "queue", label: "Queue", icon: "◎" },
+  { id: "preview", label: "Preview", icon: "▷" },
   { id: "stats", label: "Stats", icon: "▴" },
   { id: "doctor", label: "Doctor", icon: "⊕" },
   { id: "settings", label: "Settings", icon: "⚙" },
@@ -21,6 +23,10 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("library");
   const [match, setMatch] = useState<MatchRow | null>(null);
   const [queueCount, setQueueCount] = useState(0);
+
+  useEffect(() => {
+    window.reel.listQueue().then((q) => setQueueCount(q.length)).catch(() => undefined);
+  }, []);
 
   function openMatch(row: MatchRow) {
     setMatch(row);
@@ -43,7 +49,7 @@ export default function App() {
                 onClick={() => {
                   if (item.id !== "library") setMatch(null);
                   setTab(item.id);
-                  if (item.id === "queue") {
+                  if (item.id === "queue" || item.id === "preview") {
                     window.reel.listQueue().then((q) => setQueueCount(q.length));
                   }
                 }}
@@ -55,7 +61,7 @@ export default function App() {
               >
                 <span className="w-4 text-center text-xs opacity-70">{item.icon}</span>
                 <span className="flex-1 font-medium">{item.label}</span>
-                {item.id === "queue" && queueCount > 0 && (
+                {(item.id === "queue" || item.id === "preview") && queueCount > 0 && (
                   <span className="rounded-full bg-amber/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber">
                     {queueCount}
                   </span>
@@ -81,6 +87,7 @@ export default function App() {
           />
         )}
         {tab === "queue" && <QueuePage />}
+        {tab === "preview" && <PreviewPage onOpenQueue={() => setTab("queue")} />}
         {tab === "stats" && <StatsPage />}
         {tab === "doctor" && <DoctorPage />}
         {tab === "settings" && <SettingsPage />}
