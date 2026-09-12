@@ -118,7 +118,11 @@ def record(
     actions.write()
     toolchain.write_ffmpeg_ini(tools.hlae_exe, tools.ffmpeg_exe)
 
-    info(f"Recording {len(sequences)} sequence(s) - this runs the game, roughly realtime per clip")
+    mode = "unattended (background window)" if config.recording.unattended else "focused"
+    info(
+        f"Recording {len(sequences)} sequence(s) — {mode}; "
+        "CS2 still runs (roughly realtime). True no-CS2 recording is not supported."
+    )
     try:
         plugin.install_plugin(tools.cs2_folder, tools.plugin_dll)
     except RecordingSetupError:
@@ -135,6 +139,7 @@ def record(
             width=config.recording.width,
             height=config.recording.height,
             timeout_seconds=_watchdog_timeout(sequences, demo.tickrate),
+            unattended=config.recording.unattended,
         )
     finally:
         plugin.uninstall_plugin(tools.cs2_folder)

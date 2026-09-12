@@ -44,6 +44,9 @@ class RecordingConfig:
     lead_out_seconds: float = 3.0
     death_notices_duration: int = 5
     clean_hud: bool = True
+    # Keep CS2 visible but backgrounded; do not minimize (MIRV black frames).
+    # Set false to require a focused CS2 window during Record.
+    unattended: bool = True
 
 
 @dataclass

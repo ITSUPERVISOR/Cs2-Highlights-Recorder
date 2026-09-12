@@ -22,6 +22,13 @@ MANDATORY_COMMANDS = (
     "cl_demo_predict 0",
 )
 
+# HLAE docs: keep rendering / audio when the window is not focused.
+# Do NOT minimize or hide CS2 — that commonly produces black MIRV frames.
+UNATTENDED_COMMANDS = (
+    "engine_no_focus_sleep 0",
+    "snd_mute_losefocus 0",
+)
+
 
 def to_unix_path(path: Path | str) -> str:
     return str(path).replace("\\", "/")
@@ -40,6 +47,9 @@ def build_actions_file(
     for i, sequence in enumerate(sequences):
         for command in MANDATORY_COMMANDS:
             actions.add_exec(1, command)
+        if recording.unattended:
+            for command in UNATTENDED_COMMANDS:
+                actions.add_exec(1, command)
         actions.add_exec(1, f"cl_draw_only_deathnotices {1 if recording.clean_hud else 0}")
         actions.add_exec(1, f"mirv_deathmsg lifetime {recording.death_notices_duration}")
         actions.add_exec(1, "mirv_deathmsg filter clear")

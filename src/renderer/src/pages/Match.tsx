@@ -161,6 +161,10 @@ export function MatchPage({
         <div className="px-8 pt-3 text-xs text-muted">
           Copied: <code className="text-amber">{copied}</code>
           {watchHint && <p className="mt-1">{watchHint}</p>}
+          <p className="mt-1">
+            To clip without HLAE/MIRV: start OBS, add a Game Capture of CS2, then play this seek. HLAE Record is a
+            separate automated path.
+          </p>
         </div>
       )}
 

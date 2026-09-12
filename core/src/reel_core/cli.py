@@ -167,17 +167,21 @@ def doctor(as_json: bool) -> None:
         except ValueError:
             pass
         if cs2_date and hlae_date:
-            compatible = hlae_date >= cs2_date
+            latest = toolchain.fetch_latest_hlae_info()
+            verdict = toolchain.assess_hlae_vs_cs2(
+                cs2_version=inf.get("PatchVersion", "?"),
+                cs2_date=cs2_date,
+                hlae_tag=hlae_info.get("tag", ""),
+                hlae_date=hlae_date,
+                latest=latest,
+            )
             add(
                 "HLAE vs CS2 build",
-                compatible,
-                f"CS2 {inf.get('PatchVersion', '?')} ({cs2_date:%Y-%m-%d}), "
-                f"HLAE {hlae_info.get('tag', '?')} ({hlae_date:%Y-%m-%d})",
-                "" if compatible else "CS2 is newer — try Update tools after advancedfx releases a fix",
-                impact=""
-                if compatible
-                else "Record may fail until HLAE catches up. Watch + OBS still work.",
-                action=None if compatible else "update",
+                verdict.ok,
+                verdict.detail,
+                verdict.hint,
+                impact=verdict.impact,
+                action=verdict.action,
             )
         else:
             add("HLAE vs CS2 build", None, "could not compare dates (install-info.json or steam.inf missing)")
@@ -211,6 +215,28 @@ def doctor(as_json: bool) -> None:
             hint,
             impact="" if ok else "Record cannot register the CS2 plugin until gameinfo.gi is writable",
         )
+
+    if config.recording.unattended:
+        add(
+            "Unattended record",
+            True,
+            "recording.unattended=true — CS2 stays visible in the background (do not minimize)",
+            "MIRV capture needs an on-screen window. Set recording.unattended=false in config.toml to require focus.",
+        )
+    else:
+        add(
+            "Unattended record",
+            None,
+            "recording.unattended=false — keep CS2 focused during Record",
+            "Enable unattended in config.toml under [recording] unattended = true",
+        )
+
+    add(
+        "No-CS2 recording",
+        None,
+        "not supported — clips need a live CS2 + HLAE MIRV capture",
+        "Parse/score work offline; video still requires CS2. A separate demo renderer would be a different product.",
+    )
 
     work_base = app_data_dir()
     try:

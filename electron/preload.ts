@@ -7,6 +7,7 @@ const api = {
   pickFiles: () => ipcRenderer.invoke("dialog:file"),
   copyText: (text: string) => ipcRenderer.invoke("clipboard:write", text),
   openPath: (path: string) => ipcRenderer.invoke("shell:openPath", path),
+  openUrl: (url: string) => ipcRenderer.invoke("shell:openUrl", url),
   doctor: () => ipcRenderer.invoke("core:doctor"),
   updateTools: () => ipcRenderer.invoke("core:updateTools"),
   detectSteamid: () => ipcRenderer.invoke("core:detectSteamid"),

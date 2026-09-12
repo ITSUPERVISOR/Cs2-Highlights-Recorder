@@ -25,10 +25,18 @@ export function QueuePage() {
         c.name,
       ),
   );
+  const hlaeWaiting = (doctor?.checks ?? []).find((c) => c.name === "HLAE vs CS2 build" && c.ok === null);
   const canInstall = (doctor?.checks ?? []).some((c) => c.action === "install" || c.action === "update");
 
   async function record() {
-    setBusy("Recording via HLAE — keep CS2 focused. This takes roughly real time.");
+    const unattended = doctor?.checks?.some(
+      (c) => c.name === "Unattended record" && c.ok === true,
+    );
+    setBusy(
+      unattended
+        ? "Recording via HLAE — CS2 can stay in the background (keep the window visible, do not minimize). Roughly real time."
+        : "Recording via HLAE — keep CS2 focused and visible. This takes roughly real time.",
+    );
     setResult(null);
     try {
       const payload = await window.reel.recordQueue();
@@ -78,6 +86,23 @@ export function QueuePage() {
           </div>
         }
       />
+      {hlaeWaiting && (
+        <div className="rounded-xl border border-amber/40 bg-amber/10 px-5 py-4">
+          <p className="text-sm font-medium text-amber">Newest HLAE still lags this CS2 patch</p>
+          <p className="mt-2 text-sm text-fg">{hlaeWaiting.hint}</p>
+          <p className="mt-2 text-xs text-muted">
+            MIRV is HLAE&apos;s in-game recorder. Until advancedfx ships a new zip, use Watch (opens the demo at the
+            clip tick) and capture CS2 with OBS. Record is still enabled — it may crash CS2.
+          </p>
+          <button
+            type="button"
+            onClick={() => window.reel.openUrl("https://github.com/advancedfx/advancedfx/releases")}
+            className="mt-3 rounded-full border border-line px-4 py-2 text-sm font-medium"
+          >
+            Check HLAE releases
+          </button>
+        </div>
+      )}
       {recordBlockers.length > 0 && (
         <div className="rounded-xl border border-danger/40 bg-danger/10 px-5 py-4">
           <p className="text-sm font-medium text-danger">Record may not work</p>

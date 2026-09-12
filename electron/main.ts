@@ -305,6 +305,12 @@ app.whenReady().then(async () => {
     return true;
   });
   ipcMain.handle("shell:openPath", (_e, p: string) => shell.openPath(p));
+  ipcMain.handle("shell:openUrl", (_e, url: string) => {
+    if (typeof url === "string" && (url.startsWith("https://") || url.startsWith("http://"))) {
+      return shell.openExternal(url);
+    }
+    return false;
+  });
 
   ipcMain.handle("core:doctor", async () => {
     const result = await runCore(["doctor", "--json"]);

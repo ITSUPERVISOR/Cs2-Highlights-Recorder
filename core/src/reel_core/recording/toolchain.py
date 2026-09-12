@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import shutil
 import zipfile
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -19,6 +21,7 @@ from reel_core.config import Config, app_data_dir
 from reel_core.util.log import info
 
 HLAE_RELEASES_API = "https://api.github.com/repos/advancedfx/advancedfx/releases"
+HLAE_RELEASES_PAGE = "https://github.com/advancedfx/advancedfx/releases"
 FFMPEG_DOWNLOAD_URL = (
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
 )
@@ -69,6 +72,76 @@ def _pick_hlae_release(releases: list[dict]) -> tuple[str, dict]:
                     "prerelease": bool(release.get("prerelease")),
                 }
     raise RuntimeError("Could not find an HLAE release zip on GitHub")
+
+
+def fetch_latest_hlae_info() -> dict | None:
+    """Newest published HLAE zip on GitHub, including prereleases. None if offline."""
+    try:
+        releases = requests.get(
+            HLAE_RELEASES_API, timeout=20, headers={"User-Agent": "cs2-reel"}
+        ).json()
+        if not isinstance(releases, list):
+            return None
+        _, info = _pick_hlae_release(releases)
+        return info
+    except (OSError, ValueError, RuntimeError, requests.RequestException):
+        return None
+
+
+@dataclass(frozen=True)
+class HlaeCs2Check:
+    ok: bool | None
+    detail: str
+    hint: str
+    impact: str
+    action: str | None
+
+
+def assess_hlae_vs_cs2(
+    *,
+    cs2_version: str,
+    cs2_date: datetime,
+    hlae_tag: str,
+    hlae_date: datetime,
+    latest: dict | None,
+) -> HlaeCs2Check:
+    """Date heuristic plus GitHub: only offer Update when a newer HLAE zip exists."""
+    cs2_label = f"CS2 {cs2_version} ({cs2_date:%Y-%m-%d})"
+    hlae_label = f"HLAE {hlae_tag or '?'} ({hlae_date:%Y-%m-%d})"
+    detail = f"{cs2_label}, {hlae_label}"
+    if hlae_date >= cs2_date:
+        return HlaeCs2Check(True, detail, "", "", None)
+
+    latest_tag = (latest or {}).get("tag", "") if latest else ""
+    newer_zip = bool(latest and latest_tag and latest_tag != hlae_tag)
+
+    if newer_zip:
+        return HlaeCs2Check(
+            False,
+            detail,
+            f"GitHub has newer HLAE {latest_tag} — Update tools, then Re-check.",
+            "Record may fail on this CS2 patch until you install the newer HLAE. Watch + OBS still work.",
+            "update",
+        )
+
+    wait_hint = (
+        f"You already have the newest HLAE zip ({hlae_tag or 'installed'}). "
+        "advancedfx has not published a hook for this CS2 patch — Update will re-download the same files. "
+        f"Watch the clip and record in OBS, or try Record anyway. {HLAE_RELEASES_PAGE}"
+    )
+    if latest is None:
+        wait_hint = (
+            "CS2 is newer than this HLAE. Could not reach GitHub to see if a newer zip exists. "
+            f"Do not Update unless {HLAE_RELEASES_PAGE} shows a tag after {hlae_tag or 'your install'}. "
+            "Watch + OBS still work; Record may crash."
+        )
+    return HlaeCs2Check(
+        None,
+        detail,
+        wait_hint,
+        "HLAE cannot be patched from this app. Use Watch + OBS until advancedfx ships a new release. Record is still allowed and may crash.",
+        None,
+    )
 
 
 def install_hlae() -> Path:

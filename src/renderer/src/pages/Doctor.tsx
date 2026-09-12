@@ -40,6 +40,10 @@ export function DoctorPage() {
     () => (report?.checks ?? []).filter((c) => c.ok === false && c.impact),
     [report],
   );
+  const waiting = useMemo(
+    () => (report?.checks ?? []).filter((c) => c.ok === null && c.impact),
+    [report],
+  );
 
   async function installOrUpdate() {
     setInstalling(true);
@@ -91,9 +95,28 @@ export function DoctorPage() {
       {error && <p className="text-sm text-danger">{error}</p>}
       {installMsg && <p className="text-sm text-success">{installMsg}</p>}
       <p className="max-w-xl text-sm text-muted">
-        HLAE and the CS2 plugin break after some game updates. Recording stays optional — Watch still copies
-        <code className="mx-1 text-amber">playdemo name tick</code> for the console if CS2 is already open.
+        HLAE is a CS2 injector. MIRV is its command set (mirv_streams) that captures the game frame buffer to
+        video — that is Record. After a CS2 patch, only advancedfx can ship a matching HLAE; this app cannot
+        rewrite their hook. If HLAE is already newest, Update does nothing — use{" "}
+        <span className="text-fg">Watch</span> and OBS, or try Record anyway.
+        <code className="mx-1 text-amber">playdemo name tick</code> still works if CS2 is already open.
       </p>
+      {waiting.length > 0 && (
+        <div className="rounded-xl border border-amber/40 bg-amber/10 px-5 py-4">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-amber">Waiting on HLAE</p>
+          <ul className="mt-2 space-y-1.5 text-sm text-fg">
+            {waiting.map((check) => (
+              <li key={check.name}>
+                <span className="font-medium">{check.name}:</span> {check.impact}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-2 text-xs text-muted">
+            Open a clip → Watch. In OBS, capture the CS2 window. Record (MIRV) may still work — if CS2 crashes, that is
+            the HLAE hook, not Reel.
+          </p>
+        </div>
+      )}
       {impacts.length > 0 && (
         <div className="rounded-xl border border-danger/40 bg-danger/10 px-5 py-4">
           <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-danger">Won&apos;t work until fixed</p>
@@ -111,7 +134,7 @@ export function DoctorPage() {
           <div
             key={check.name}
             className={`flex items-start justify-between gap-4 rounded-xl border bg-panel/70 px-5 py-3 ${
-              check.ok === false ? "border-danger/40" : "border-line"
+              check.ok === false ? "border-danger/40" : check.ok === null && check.impact ? "border-amber/40" : "border-line"
             }`}
           >
             <div className="min-w-0 flex-1">
@@ -123,7 +146,7 @@ export function DoctorPage() {
               )}
             </div>
             <div className="flex shrink-0 flex-col items-end gap-2">
-              <Status ok={check.ok} />
+              <Status ok={check.ok} wait={check.name === "HLAE vs CS2 build" && check.ok === null} />
               {needsToolsAction(check) && (
                 <button
                   type="button"
@@ -134,6 +157,15 @@ export function DoctorPage() {
                   {installing ? "…" : check.action === "install" ? "Install" : "Update"}
                 </button>
               )}
+              {check.name === "HLAE vs CS2 build" && check.ok !== true && (
+                <button
+                  type="button"
+                  onClick={() => window.reel.openUrl("https://github.com/advancedfx/advancedfx/releases")}
+                  className="rounded-full border border-line px-3 py-1 text-xs font-medium text-muted hover:text-fg"
+                >
+                  HLAE releases
+                </button>
+              )}
             </div>
           </div>
         ))}
@@ -142,8 +174,9 @@ export function DoctorPage() {
   );
 }
 
-function Status({ ok }: { ok: boolean | null }) {
+function Status({ ok, wait }: { ok: boolean | null; wait?: boolean }) {
   if (ok === true) return <span className="text-sm font-medium text-success">OK</span>;
+  if (wait) return <span className="text-sm text-amber">Wait</span>;
   if (ok === null) return <span className="text-sm text-amber">Optional</span>;
   return <span className="text-sm font-medium text-danger">Fail</span>;
 }

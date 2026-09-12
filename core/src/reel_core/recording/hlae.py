@@ -84,6 +84,7 @@ def run_game_with_hlae(
     width: int,
     height: int,
     timeout_seconds: float,
+    unattended: bool = True,
 ) -> None:
     if kill_processes(GAME_PROCESS):
         info("Killed a running CS2 instance, waiting for file locks to release...")
@@ -113,7 +114,18 @@ def run_game_with_hlae(
     if game is None:
         raise GameError(f"CS2 did not start (or crashed immediately).{crash_suffix()}")
 
-    info("CS2 is running, recording in progress (the game will close itself when done)...")
+    if unattended:
+        from reel_core.recording.win32_window import prepare_unattended_game_window
+
+        # Sink behind other windows but keep fully visible — never minimize/hide.
+        prepare_unattended_game_window(game.pid)
+        info(
+            "CS2 is recording in unattended mode (window kept visible in the background; "
+            "do not minimize). Still roughly realtime."
+        )
+    else:
+        info("CS2 is running — keep the game focused until it quits (roughly realtime)...")
+
     if not wait_for_process_exit(game, timeout=timeout_seconds):
         kill_processes(GAME_PROCESS)
         raise GameError(
