@@ -214,6 +214,17 @@ def doctor(as_json: bool) -> None:
     )
 
     if cs2_folder is not None:
+        from reel_core.demo.map_assets import list_installed_maps
+
+        maps = list_installed_maps()
+        add(
+            "CS2 maps",
+            True if maps else None,
+            f"{len(maps)} map VPK(s) in install" if maps else "no playable maps/*.vpk found",
+            impact="" if maps else "Preview will use a flat ground plane until CS2 maps are installed",
+        )
+
+    if cs2_folder is not None:
         from reel_core.recording.plugin import gameinfo_status
 
         ok, detail, hint = gameinfo_status(cs2_folder)
@@ -535,12 +546,14 @@ def preview(
 @click.option("--json", "as_json", is_flag=True)
 def preview_map(map_name: str, as_json: bool) -> None:
     """Export a local CS2 map mesh for Preview (Source2Viewer CLI, cached)."""
-    from reel_core.demo.map_assets import export_map_gltf
+    from reel_core.demo.map_assets import export_map_gltf, map_is_installed, resolve_map_stem
 
-    path, source = export_map_gltf(map_name)
+    stem = resolve_map_stem(map_name)
+    path, source = export_map_gltf(stem)
     payload = {
         "ok": True,
-        "map": map_name,
+        "map": stem,
+        "mapInstalled": map_is_installed(stem),
         "mapGltf": str(path) if path else None,
         "mapSource": source,
     }
@@ -551,9 +564,11 @@ def preview_map(map_name: str, as_json: bool) -> None:
 
 
 @main.command(name="preview-assets")
-@click.option("--spec", "spec_path", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--spec", "spec_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--warm", is_flag=True, help="Prefetch every gun GLB plus SAS/Phoenix locomotion.")
+@click.option("--skins-all", "skins_all", is_flag=True, help="Bake every paint kit at 64px into AppData.")
 @click.option("--json", "as_json", is_flag=True)
-def preview_assets(spec_path: str, as_json: bool) -> None:
+def preview_assets(spec_path: str | None, warm: bool, skins_all: bool, as_json: bool) -> None:
     """Export local CS2 weapon and agent models for Preview (cached).
 
     The spec is read from a file rather than the command line because the
@@ -562,12 +577,24 @@ def preview_assets(spec_path: str, as_json: bool) -> None:
     """
     from reel_core.demo.game_assets import export_assets
 
-    try:
-        spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        payload = {"ok": False, "error": f"unreadable spec: {exc}"}
-    else:
-        payload = export_assets(spec if isinstance(spec, dict) else {})
+    spec: dict = {}
+    if spec_path:
+        try:
+            loaded = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            payload = {"ok": False, "error": f"unreadable spec: {exc}"}
+            if as_json:
+                click.echo(json.dumps(payload))
+                return
+            raise click.ClickException(payload["error"]) from exc
+        spec = loaded if isinstance(loaded, dict) else {}
+    elif not warm and not skins_all:
+        raise click.UsageError("Provide --spec, --warm or --skins-all")
+    if warm:
+        spec["warm"] = True
+    if skins_all:
+        spec["skinsAll"] = True
+    payload = export_assets(spec)
 
     if as_json:
         click.echo(json.dumps(payload))
@@ -575,8 +602,33 @@ def preview_assets(spec_path: str, as_json: bool) -> None:
     info(
         f"Assets  weapons={len(payload.get('weapons') or {})}  "
         f"agents={len(payload.get('agents') or {})}  "
-        f"missing={payload.get('weaponsMissing') or []}"
+        f"missing={payload.get('weaponsMissing') or []}  "
+        f"skins={len(payload.get('skins') or {})}"
     )
+
+
+@main.command(name="preview-audit-poses")
+@click.option("--spec", "spec_path", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--json", "as_json", is_flag=True)
+def preview_audit_poses(spec_path: str, as_json: bool) -> None:
+    """Check weapon-table viewmodel pose names against pak01."""
+    from reel_core.demo.pose_audit import audit_viewmodel_poses
+
+    try:
+        spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        payload = {"ok": False, "error": f"unreadable spec: {exc}"}
+    else:
+        poses = spec.get("poses") if isinstance(spec, dict) else spec
+        payload = audit_viewmodel_poses(list(poses or []))
+
+    if as_json:
+        click.echo(json.dumps(payload))
+        return
+    missing = payload.get("missing") or []
+    info(f"Pose audit  listed={payload.get('listed', 0)}  missing={len(missing)}")
+    for name in missing[:40]:
+        info(f"  missing {name}")
 
 
 def _sequences_from_payload(items: list[dict], demo: DemoData, player_steamid: str | None) -> list[Sequence]:

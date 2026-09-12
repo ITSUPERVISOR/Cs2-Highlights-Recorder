@@ -18,8 +18,9 @@ const PHASE_LABEL: Record<Phase, string> = {
 };
 
 /** Describe the geometry on screen, not the exporter that ran. */
-function describeGeometry(mapSource: string, status: MapStatus | null) {
-  if (mapSource !== "collision") return "flat ground (no map export)";
+function describeGeometry(mapSource: string, status: MapStatus | null, mapInstalled?: boolean) {
+  if (mapSource === "missing" || mapInstalled === false) return "flat ground (map not in CS2 install)";
+  if (mapSource !== "collision") return "flat ground (no collision hull)";
   switch (status) {
     case "ready":
       return "collision mesh";
@@ -43,10 +44,12 @@ function describeGaps(assets: AssetBundle | null) {
   if (!assets) return "";
   const missing = assets.weaponsMissing ?? [];
   const unmatched = Object.values(assets.unmatchedAnims ?? {}).flat();
-  if (!missing.length && !unmatched.length) return "";
+  const painted = Object.keys(assets.skins ?? {}).length;
+  if (!missing.length && !unmatched.length && !painted) return "";
   const bits: string[] = [];
   if (missing.length) bits.push(`${missing.length} weapon${missing.length === 1 ? "" : "s"} missing`);
   if (unmatched.length) bits.push("some poses unmatched");
+  if (painted) bits.push(`${painted} skin${painted === 1 ? "" : "s"}`);
   return bits.join(" · ");
 }
 
@@ -455,7 +458,7 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
           {dump && (
             <p className="text-[11px] text-muted">
               {formatMap(dump.map)} · {dump.frames.length} poses ·{" "}
-              {describeGeometry(dump.mapSource, mapStatus)}
+              {describeGeometry(dump.mapSource, mapStatus, dump.mapInstalled)}
               {hands ? ` · ${hands}` : ""}
               {gaps ? ` · ${gaps}` : ""}
             </p>

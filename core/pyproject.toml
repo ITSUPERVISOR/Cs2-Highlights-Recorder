@@ -17,6 +17,7 @@ dependencies = [
     "tomli-w>=1",
     "requests>=2.31",
     "zstandard>=0.22",
+    "pillow>=10",
 ]
 
 [project.optional-dependencies]

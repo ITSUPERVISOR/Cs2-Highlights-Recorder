@@ -231,6 +231,40 @@ def _run_cli(args: list[str], timeout: int = 900) -> tuple[bool, str]:
     return proc.returncode == 0, f"{proc.stdout or ''}\n{proc.stderr or ''}"
 
 
+def parse_pak_list_output(output: str) -> list[str]:
+    """Paths from Source2Viewer ``-l`` output, ignoring banners and progress."""
+    entries: list[str] = []
+    for line in (output or "").splitlines():
+        text = line.strip().replace("\\", "/")
+        if not text:
+            continue
+        lower = text.lower()
+        if lower.startswith(("source2", "valve", "error", "warn", "info", "decompile")):
+            continue
+        if "://" in text:
+            continue
+        token = text.split()[0]
+        if "/" not in token and "." not in token:
+            continue
+        entries.append(token)
+    return entries
+
+
+def list_pak_entries(prefix: str = "", extension: str = "") -> list[str]:
+    """File paths inside ``pak01_dir.vpk``, filtered by folder and/or extension."""
+    cli = _resolve_cli()
+    pak = find_pak()
+    if cli is None or pak is None:
+        return []
+    args = [str(cli), "-i", str(pak), "-l"]
+    if prefix:
+        args.extend(["-f", prefix.replace("\\", "/")])
+    if extension:
+        args.extend(["-e", extension])
+    _ok, output = _run_cli(args, timeout=180)
+    return parse_pak_list_output(output)
+
+
 def _unmatched(output: str) -> list[str]:
     """Animation names the exporter did not recognise, which it only warns about."""
     missing: list[str] = []
@@ -375,12 +409,28 @@ def export_agent(agent: str, anims: list[str]) -> tuple[str | None, list[str]]:
 def export_assets(spec: dict) -> dict:
     """Export everything one clip needs.
 
-    ``spec`` is ``{"weapons": [...], "agents": {"<agent>": ["<anim>", ...]}}``,
-    built by the renderer because the weapon table and the animation names live
-    there.
+    ``spec`` is ``{"weapons": [...], "agents": {"<agent>": ["<anim>", ...]},
+    "skins": [...], "warm": false, "skinsAll": false}``. ``warm`` merges the
+    full gun list plus SAS/Phoenix locomotion. ``skinsAll`` bakes every paint
+    kit at 64px into AppData.
     """
-    weapons_in = spec.get("weapons") or []
-    agents_in = spec.get("agents") or {}
+    from reel_core.demo.skins import export_all_skins, export_skins
+    from reel_core.demo.warm_assets import warm_spec
+
+    data = dict(spec or {})
+    if data.get("warm"):
+        extra = warm_spec()
+        weapons_in = list(data.get("weapons") or []) + list(extra.get("weapons") or [])
+        agents_in = dict(extra.get("agents") or {})
+        incoming = data.get("agents") or {}
+        if isinstance(incoming, dict):
+            for agent, anims in incoming.items():
+                agents_in[str(agent)] = sorted(set(list(agents_in.get(str(agent)) or []) + list(anims or [])))
+        data["weapons"] = weapons_in
+        data["agents"] = agents_in
+    else:
+        weapons_in = data.get("weapons") or []
+        agents_in = data.get("agents") or {}
 
     weapons, weapons_missing = export_weapons(list(weapons_in))
 
@@ -410,10 +460,15 @@ def export_assets(spec: dict) -> dict:
         if missing:
             unmatched[agent] = sorted(set(missing))
 
+    skins = export_skins(list(data.get("skins") or []))
+    if data.get("skinsAll"):
+        skins = {**skins, **export_all_skins()}
+
     return {
-        "ok": bool(weapons or agents),
+        "ok": bool(weapons or agents or skins),
         "weapons": weapons,
         "agents": agents,
+        "skins": skins,
         "weaponsMissing": sorted(weapons_missing),
         "unmatchedAnims": unmatched,
         "cacheDir": str(assets_cache_dir()),

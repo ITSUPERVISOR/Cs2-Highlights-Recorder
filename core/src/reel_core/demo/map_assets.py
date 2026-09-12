@@ -19,10 +19,47 @@ from reel_core.recording import steam, toolchain
 EXPORT_KIND = "collision"
 EXPORT_VERSION = 2
 MARKER_NAME = "export.json"
+MISSING_KIND = "missing"
 
 MIN_MESH_BYTES = 1024
 # Hard ceiling so an oversized export can never be handed to the renderer again.
 MAX_MESH_BYTES = 400 * 1024 * 1024
+
+# Demo headers and library rows sometimes drop the official prefix
+# (`dust2` instead of `de_dust2`). Cache keys and VPK lookup share this table.
+MAP_ALIASES = {
+    "dust2": "de_dust2",
+    "dustii": "de_dust2",
+    "dust": "de_dust2",
+    "inferno": "de_inferno",
+    "mirage": "de_mirage",
+    "nuke": "de_nuke",
+    "ancient": "de_ancient",
+    "anubis": "de_anubis",
+    "cache": "de_cache",
+    "overpass": "de_overpass",
+    "vertigo": "de_vertigo",
+    "train": "de_train",
+    "office": "cs_office",
+    "italy": "cs_italy",
+    "agency": "cs_agency",
+    "militia": "cs_militia",
+    "assault": "cs_assault",
+    "baggage": "ar_baggage",
+    "shoots": "ar_shoots",
+    "poolday": "ar_pool_day",
+    "pool_day": "ar_pool_day",
+    "boulder": "de_boulder",
+    "fachwerk": "de_fachwerk",
+    "shelter": "de_shelter",
+    "debris": "de_debris",
+    "eldorado": "de_eldorado",
+    "el_dorado": "de_eldorado",
+}
+
+MAP_PREFIXES = ("de_", "cs_", "ar_", "gd_")
+# Workshop extras and lighting dumps live next to playable VPKs.
+_SKIP_MAP_TOKENS = ("_vanity", "_preview", "_cameras", "graphics", "lightmap", "sound")
 
 
 def maps_cache_dir() -> Path:
@@ -35,19 +72,74 @@ def find_source2viewer() -> Path | None:
     return toolchain.find_source2viewer()
 
 
-def find_map_vpk(map_name: str) -> Path | None:
+def map_stem(map_name: str) -> str:
+    """Bare lowercase stem: `de_dust2.vpk` and `maps/de_dust2` both become `de_dust2`."""
+    raw = Path(str(map_name or "")).name
+    stem = raw.lower().removesuffix(".vpk").strip().replace(" ", "_")
+    return stem or "unknown"
+
+
+def canonical_map_stem(map_name: str) -> str:
+    stem = map_stem(map_name)
+    return MAP_ALIASES.get(stem, stem)
+
+
+def _map_dirs() -> list[Path]:
     folder = steam.get_cs2_folder()
     if folder is None:
-        return None
-    stem = Path(map_name).name
-    candidates = [
-        folder / "game" / "csgo" / "maps" / f"{stem}.vpk",
-        folder / "csgo" / "maps" / f"{stem}.vpk",
-    ]
-    for path in candidates:
+        return []
+    return [folder / "game" / "csgo" / "maps", folder / "csgo" / "maps"]
+
+
+def _skip_map_vpk(stem: str) -> bool:
+    if stem.endswith("_dir"):
+        return True
+    return any(token in stem for token in _SKIP_MAP_TOKENS)
+
+
+def list_installed_maps() -> list[str]:
+    """Playable map VPK stems in the local CS2 install, sorted."""
+    found: set[str] = set()
+    for directory in _map_dirs():
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.vpk"):
+            stem = path.stem.lower()
+            if _skip_map_vpk(stem):
+                continue
+            found.add(stem)
+    return sorted(found)
+
+
+def resolve_map_stem(map_name: str, installed: list[str] | None = None) -> str:
+    """Alias + prefix match against the install so `dust2` finds `de_dust2.vpk`."""
+    stem = canonical_map_stem(map_name)
+    pool = list(installed) if installed is not None else list_installed_maps()
+    present = set(pool)
+    if stem in present:
+        return stem
+    if stem != "unknown":
+        for prefix in MAP_PREFIXES:
+            candidate = stem if stem.startswith(prefix) else f"{prefix}{stem}"
+            if candidate in present:
+                return candidate
+        matches = [name for name in pool if name == stem or name.endswith(f"_{stem}") or name.endswith(stem)]
+        if len(matches) == 1:
+            return matches[0]
+    return stem
+
+
+def find_map_vpk(map_name: str) -> Path | None:
+    stem = resolve_map_stem(map_name)
+    for directory in _map_dirs():
+        path = directory / f"{stem}.vpk"
         if path.is_file():
             return path
     return None
+
+
+def map_is_installed(map_name: str) -> bool:
+    return find_map_vpk(map_name) is not None
 
 
 def _gameinfo() -> Path | None:
@@ -243,21 +335,26 @@ def resolve_map_gltf(
     *,
     export: bool = False,
 ) -> tuple[Path | None, str]:
-    """Return ``(mesh, kind)`` where kind is ``collision`` or ``fallback``."""
-    stem = Path(map_name).name or "unknown"
+    """Return ``(mesh, kind)`` where kind is ``collision``, ``fallback`` or ``missing``.
+
+    ``missing`` means the map VPK is not in the CS2 install. ``fallback`` means
+    it is (or we cannot tell) but there is no collision hull to show.
+    """
+    stem = resolve_map_stem(map_name)
     dest_dir = maps_cache_dir() / stem
     existing = _cached_world(dest_dir)
     if existing is not None:
         return existing, EXPORT_KIND
 
-    if export:
-        vpk = find_map_vpk(stem)
-        if vpk is not None:
-            exported = _try_source2viewer(vpk, dest_dir)
-            if exported is not None:
-                return exported, EXPORT_KIND
+    vpk = find_map_vpk(stem)
+    if export and vpk is not None:
+        exported = _try_source2viewer(vpk, dest_dir)
+        if exported is not None:
+            return exported, EXPORT_KIND
 
     fallback = write_fallback_gltf(stem, frames)
+    if vpk is None and stem != "unknown":
+        return fallback, MISSING_KIND
     return fallback, "fallback"
 
 

@@ -1,10 +1,10 @@
 /**
  * Materials for the extracted CS2 models.
  *
- * The exports deliberately carry no textures: CS2 ships 4K PNGs and the AK alone
- * came to 66.6 MB of them, which is out of proportion to a pose replay. What the
- * exports *do* carry is `NORMAL` and `TANGENT`, so these plain materials still
- * shade properly and read as metal, fabric and skin rather than flat colour.
+ * The exports deliberately carry no 4K textures: CS2 ships those and the AK
+ * alone came to 66.6 MB. Clip-scoped skins arrive as a 64px nearest albedo
+ * when the demo names a paint kit; otherwise these Lambert fills posterize
+ * like a PS1 vertex light.
  *
  * Every material is a module-level singleton. Ten players holding an AK share
  * one gunmetal instance, which keeps the draw call count and the GPU program
@@ -22,42 +22,66 @@ const GLOVE = 0x6a5848;
 const SLEEVE = 0x3d4450;
 const VEST = 0x24272d;
 
-let gunmetal: THREE.MeshStandardMaterial | null = null;
-let furniture: THREE.MeshStandardMaterial | null = null;
-let blade: THREE.MeshStandardMaterial | null = null;
-let skin: THREE.MeshStandardMaterial | null = null;
-let glove: THREE.MeshStandardMaterial | null = null;
-let sleeve: THREE.MeshStandardMaterial | null = null;
-const cloth = new Map<string, THREE.MeshStandardMaterial>();
+/** Quantize an sRGB hex to `bits` per channel so solids band like PS1 lighting. */
+export function posterizeColor(hex: number, bits = 5): number {
+  const levels = (1 << bits) - 1;
+  const quant = (channel: number) => Math.round((Math.round((channel / 255) * levels) / levels) * 255);
+  return (quant((hex >> 16) & 255) << 16) | (quant((hex >> 8) & 255) << 8) | quant(hex & 255);
+}
+
+/** Crunchy, unlit-adjacent fill: Lambert, flat, no PBR gloss. */
+export function previewLambert(hex: number): THREE.MeshLambertMaterial {
+  return new THREE.MeshLambertMaterial({
+    color: posterizeColor(hex),
+    flatShading: true,
+  });
+}
+
+/** Nearest, no mips — the 64px albedo should stay blocky on screen. */
+export function crunchTexture(texture: THREE.Texture) {
+  texture.magFilter = THREE.NearestFilter;
+  texture.minFilter = THREE.NearestFilter;
+  texture.generateMipmaps = false;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+let gunmetal: THREE.MeshLambertMaterial | null = null;
+let furniture: THREE.MeshLambertMaterial | null = null;
+let blade: THREE.MeshLambertMaterial | null = null;
+let skin: THREE.MeshLambertMaterial | null = null;
+let glove: THREE.MeshLambertMaterial | null = null;
+let sleeve: THREE.MeshLambertMaterial | null = null;
+const cloth = new Map<string, THREE.MeshLambertMaterial>();
 
 export function gunmetalMaterial() {
-  gunmetal ??= new THREE.MeshStandardMaterial({ color: GUNMETAL, roughness: 0.32, metalness: 0.82 });
+  gunmetal ??= previewLambert(GUNMETAL);
   return gunmetal;
 }
 
 /** Polymer and wood: the parts of a gun that are not steel. */
 export function furnitureMaterial() {
-  furniture ??= new THREE.MeshStandardMaterial({ color: GUN_FURNITURE, roughness: 0.72, metalness: 0.08 });
+  furniture ??= previewLambert(GUN_FURNITURE);
   return furniture;
 }
 
 export function bladeMaterial() {
-  blade ??= new THREE.MeshStandardMaterial({ color: BLADE, roughness: 0.18, metalness: 0.92 });
+  blade ??= previewLambert(BLADE);
   return blade;
 }
 
 export function skinMaterial() {
-  skin ??= new THREE.MeshStandardMaterial({ color: SKIN, roughness: 0.78, metalness: 0.02 });
+  skin ??= previewLambert(SKIN);
   return skin;
 }
 
 export function gloveMaterial() {
-  glove ??= new THREE.MeshStandardMaterial({ color: GLOVE, roughness: 0.66, metalness: 0.06 });
+  glove ??= previewLambert(GLOVE);
   return glove;
 }
 
 export function sleeveMaterial() {
-  sleeve ??= new THREE.MeshStandardMaterial({ color: SLEEVE, roughness: 0.7, metalness: 0.05 });
+  sleeve ??= previewLambert(SLEEVE);
   return sleeve;
 }
 
@@ -66,18 +90,14 @@ export function clothMaterial(team: string) {
   const key = team || "none";
   let mat = cloth.get(key);
   if (!mat) {
-    mat = new THREE.MeshStandardMaterial({
-      color: teamColor(team),
-      roughness: 0.66,
-      metalness: 0.06,
-    });
+    mat = previewLambert(teamColor(team));
     cloth.set(key, mat);
   }
   return mat;
 }
 
 export function vestMaterial() {
-  return new THREE.MeshStandardMaterial({ color: VEST, roughness: 0.55, metalness: 0.12 });
+  return previewLambert(VEST);
 }
 
 function assign(mesh: THREE.Mesh, material: THREE.Material) {
@@ -93,12 +113,20 @@ function assign(mesh: THREE.Mesh, material: THREE.Material) {
  * Without per-material data from the export there is no way to tell a stock from
  * a barrel, so one convincing metal beats a wrong guess at two.
  */
-export function applyWeaponMaterials(root: THREE.Object3D, kind: string) {
+export function applyWeaponMaterials(root: THREE.Object3D, kind: string, map?: THREE.Texture | null) {
   const metal = kind === "knife" ? bladeMaterial() : gunmetalMaterial();
+  const painted =
+    map != null
+      ? new THREE.MeshLambertMaterial({
+          map: crunchTexture(map),
+          color: 0xffffff,
+          flatShading: true,
+        })
+      : metal;
   root.traverse((child) => {
     const mesh = child as THREE.Mesh;
     if (!mesh.isMesh) return;
-    assign(mesh, metal);
+    assign(mesh, painted);
   });
 }
 

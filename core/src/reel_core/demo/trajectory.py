@@ -17,7 +17,7 @@ STRIDE = 2
 
 # Bumped whenever the dump payload gains fields. Cached dumps from an older
 # schema would otherwise be re-served without them and nothing would appear.
-SCHEMA = 3
+SCHEMA = 5
 
 # The AK's reload animation runs 2.433s, so a reload that began shortly before
 # the window is still playing inside it. Equips and zooms are instantaneous but
@@ -50,6 +50,8 @@ EXTRA_FIELDS = (
     "CCSPlayerPawn.CCSPlayer_MovementServices.m_flDuckAmount",
     "CCSPlayerPawn.m_ArmorValue",
     "CCSPlayerPawn.m_szLastPlaceName",
+    "active_weapon_skin",
+    "fall_back_paint_kit",
 )
 
 
@@ -229,6 +231,8 @@ def frames_from_dataframe(df: pd.DataFrame) -> list[dict]:
                 "scoped": _bool(row, "CCSPlayerPawn.m_bIsScoped", default=False),
                 "walking": _bool(row, "CCSPlayerPawn.m_bIsWalking", default=False),
                 "place": _str(row, "CCSPlayerPawn.m_szLastPlaceName"),
+                "skin": _str(row, "active_weapon_skin"),
+                "paintKit": int(_num(row, "fall_back_paint_kit", default=0.0)),
             }
         if players:
             frames.append({"tick": int(tick), "players": players})
@@ -592,7 +596,129 @@ def _timed_volumes(
     return out
 
 
+def _event_ticks(parser: DemoParser, name: str) -> list[int]:
+    df = _safe_event(parser, name)
+    if df.empty or "tick" not in df.columns:
+        return []
+    out: list[int] = []
+    for value in df["tick"]:
+        try:
+            out.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _event_xyz(row: pd.Series) -> tuple[float, float, float] | None:
+    x = _num(row, "user_X", "x", "X")
+    y = _num(row, "user_Y", "y", "Y")
+    z = _num(row, "user_Z", "z", "Z")
+    if x == 0.0 and y == 0.0 and z == 0.0:
+        return None
+    return (x, y, z)
+
+
+def _pose_xyz(frames: list[dict], tick: int, steamid: str) -> tuple[float, float, float] | None:
+    if not steamid:
+        return None
+    best: dict | None = None
+    for frame in frames:
+        if int(frame.get("tick") or 0) > tick:
+            break
+        pose = (frame.get("players") or {}).get(steamid)
+        if pose:
+            best = pose
+    if not best:
+        return None
+    return (float(best.get("x") or 0), float(best.get("y") or 0), float(best.get("z") or 0))
+
+
+def _bomb_starts(parser: DemoParser, name: str) -> list[dict]:
+    """Plant/drop events with the carrier's position at that tick."""
+    df = _safe_event(parser, name, player=["X", "Y", "Z"])
+    if df.empty:
+        df = _safe_event(parser, name)
+    if df.empty or "tick" not in df.columns:
+        return []
+    out: list[dict] = []
+    for _, row in df.sort_values("tick").iterrows():
+        try:
+            tick = int(row["tick"])
+        except (TypeError, ValueError):
+            continue
+        xyz = _event_xyz(row)
+        steamid = canonicalize_steamid(_str(row, "user_steamid"))
+        item: dict = {"tick": tick, "steamid": steamid}
+        if xyz:
+            item["x"], item["y"], item["z"] = (round(v, 1) for v in xyz)
+        out.append(item)
+    return out
+
+
+def _next_at_or_after(ticks: list[int], start: int) -> int | None:
+    return next((t for t in ticks if t >= start), None)
+
+
+def _bombs_in_window(
+    parser: DemoParser, start_tick: int, end_tick: int, frames: list[dict]
+) -> list[dict]:
+    """World C4 while it is on the ground or planted, overlapping the clip.
+
+    One bomb at a time. A drop that was picked up before the window is omitted
+    the same way a spent smoke is; a plant from before the window stays visible.
+    """
+    planted = _bomb_starts(parser, "bomb_planted")
+    dropped = _bomb_starts(parser, "bomb_dropped")
+    if not planted and not dropped:
+        return []
+
+    pickups = _event_ticks(parser, "bomb_pickup")
+    defused = _event_ticks(parser, "bomb_defused")
+    exploded = _event_ticks(parser, "bomb_exploded")
+    round_over = (
+        _event_ticks(parser, "round_end")
+        + _event_ticks(parser, "round_officially_ended")
+        + _event_ticks(parser, "begin_new_match")
+    )
+    plant_ticks = [row["tick"] for row in planted]
+    drop_ends = sorted(pickups + plant_ticks + round_over)
+    plant_ends = sorted(defused + exploded + round_over)
+
+    out: list[dict] = []
+    for kind, starts, ends in (
+        ("dropped", dropped, drop_ends),
+        ("planted", planted, plant_ends),
+    ):
+        for row in starts:
+            tick = int(row["tick"])
+            if tick > end_tick:
+                continue
+            end = _next_at_or_after(ends, tick)
+            if end is not None and end < start_tick:
+                continue
+            xyz = None
+            if "x" in row:
+                xyz = (row["x"], row["y"], row["z"])
+            if xyz is None:
+                xyz = _pose_xyz(frames, tick, str(row.get("steamid") or ""))
+            if xyz is None:
+                continue
+            out.append(
+                {
+                    "kind": kind,
+                    "tick": tick,
+                    "endTick": end,
+                    "x": round(float(xyz[0]), 1),
+                    "y": round(float(xyz[1]), 1),
+                    "z": round(float(xyz[2]), 1),
+                }
+            )
+    out.sort(key=lambda item: item["tick"])
+    return out
+
+
 def _bursts(parser: DemoParser, start_tick: int, end_tick: int) -> list[dict]:
+
     """One-shot detonations: HE and flashbang."""
     out: list[dict] = []
     for kind, event in (("he", "hegrenade_detonate"), ("flash", "flashbang_detonate")):
@@ -646,7 +772,6 @@ def dump_clip_trajectory(
         header = parser.parse_header() or {}
     except Exception:
         pass
-    resolved_map = map_name or str(header.get("map_name") or "unknown")
     df = _parse_pose_ticks(parser, ticks)
     df = _merge_extras(df, _parse_extra_ticks(parser, ticks))
     frames = frames_from_dataframe(df)
@@ -685,14 +810,17 @@ def dump_clip_trajectory(
         parser, "weapon_zoom", int(start_tick), int(end_tick), lookback_ticks=lookback
     )
     throws = _throws_in_window(parser, int(start_tick), int(end_tick), lookback_ticks=lookback)
+    bombs = _bombs_in_window(parser, int(start_tick), int(end_tick), frames)
 
-    from reel_core.demo.map_assets import resolve_map_gltf
+    from reel_core.demo.map_assets import map_is_installed, resolve_map_gltf, resolve_map_stem
 
+    resolved_map = resolve_map_stem(map_name or str(header.get("map_name") or "unknown"))
     gltf_path, map_source = resolve_map_gltf(resolved_map, frames, export=False)
 
     payload = {
         "tickrate": float(tickrate) or DEFAULT_TICKRATE,
         "map": resolved_map,
+        "mapInstalled": map_is_installed(resolved_map),
         "povSteamid": pov,
         "startTick": int(start_tick),
         "endTick": int(end_tick),
@@ -708,6 +836,7 @@ def dump_clip_trajectory(
         "equips": equips,
         "zooms": zooms,
         "throws": throws,
+        "bombs": bombs,
         "mapGltf": str(gltf_path) if gltf_path else None,
         "mapSource": map_source,
         "cachePath": str(cache_file),

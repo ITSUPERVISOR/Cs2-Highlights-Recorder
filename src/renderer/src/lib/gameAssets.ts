@@ -28,6 +28,8 @@ export type AssetBundle = {
   weapons: Record<string, string>;
   /** Agent name to the cached .glb on disk. */
   agents: Record<string, string>;
+  /** Paint-kit key to a 64px albedo PNG. */
+  skins: Record<string, string>;
   weaponsMissing: string[];
   /** Animation names the exporter did not recognise, per agent. */
   unmatchedAnims: Record<string, string[]>;
@@ -115,6 +117,39 @@ export async function loadAsset(filePath: string | null | undefined): Promise<Lo
   return loadGltfCached(filePath);
 }
 
+const textureCache = new Map<string, THREE.Texture>();
+const textureInflight = new Map<string, Promise<THREE.Texture | null>>();
+
+/** A PNG/JPEG under the AppData cache, loaded through the reelmap protocol. */
+export function loadPreviewTexture(filePath: string | null | undefined): Promise<THREE.Texture | null> {
+  if (!filePath) return Promise.resolve(null);
+  const hit = textureCache.get(filePath);
+  if (hit) return Promise.resolve(hit);
+  const pending = textureInflight.get(filePath);
+  if (pending) return pending;
+  const job = new Promise<THREE.Texture | null>((resolve) => {
+    const url = `reelmap://asset/?path=${encodeURIComponent(filePath)}`;
+    const loader = new THREE.TextureLoader();
+    loader.load(
+      url,
+      (texture) => {
+        texture.colorSpace = THREE.SRGBColorSpace;
+        texture.wrapS = THREE.RepeatWrapping;
+        texture.wrapT = THREE.RepeatWrapping;
+        texture.magFilter = THREE.NearestFilter;
+        texture.minFilter = THREE.NearestFilter;
+        texture.generateMipmaps = false;
+        textureCache.set(filePath, texture);
+        resolve(texture);
+      },
+      undefined,
+      () => resolve(null),
+    );
+  }).finally(() => textureInflight.delete(filePath));
+  textureInflight.set(filePath, job);
+  return job;
+}
+
 /** Nodes by name, for looking up bones without walking the tree each frame. */
 export function collectBones(root: THREE.Object3D): Map<string, THREE.Object3D> {
   const bones = new Map<string, THREE.Object3D>();
@@ -147,6 +182,11 @@ export function bundleAgentPath(bundle: AssetBundle | null, agent: string): stri
   return bundle.agents?.[agent] ?? null;
 }
 
+export function bundleSkinPath(bundle: AssetBundle | null, key: string | null | undefined): string | null {
+  if (!bundle || !key) return null;
+  return bundle.skins?.[key] ?? null;
+}
+
 /** Wave-2 paths win; missing-anim lists are unioned so the footer can report them. */
 export function mergeAssetBundles(base: AssetBundle | null, extra: AssetBundle): AssetBundle {
   const unmatched: Record<string, string[]> = { ...(base?.unmatchedAnims ?? {}) };
@@ -157,6 +197,7 @@ export function mergeAssetBundles(base: AssetBundle | null, extra: AssetBundle):
     ok: Boolean(base?.ok || extra.ok),
     weapons: { ...base?.weapons, ...extra.weapons },
     agents: { ...base?.agents, ...extra.agents },
+    skins: { ...base?.skins, ...(extra.skins ?? {}) },
     weaponsMissing: [...new Set([...(base?.weaponsMissing ?? []), ...(extra.weaponsMissing ?? [])])].sort(),
     unmatchedAnims: unmatched,
     cacheDir: extra.cacheDir || base?.cacheDir || "",

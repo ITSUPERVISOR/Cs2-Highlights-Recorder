@@ -16,11 +16,13 @@
 import * as THREE from "three";
 import { applyWeaponMaterials } from "./assetMaterials";
 import {
+  bundleSkinPath,
   bundleWeaponPath,
   collectBones,
   findClip,
   instantiate,
   loadAsset,
+  loadPreviewTexture,
   meshBounds,
   METRES_TO_INCHES,
   type AssetBundle,
@@ -118,7 +120,7 @@ function makeAction(mixer: THREE.AnimationMixer, clip: THREE.AnimationClip | nul
 export async function makeWeaponModel(
   bundle: AssetBundle | null,
   info: WeaponInfo,
-  opts: { attached?: boolean } = {},
+  opts: { attached?: boolean; skinKey?: string } = {},
 ): Promise<WeaponModel | null> {
   const path = bundleWeaponPath(bundle, info.model);
   if (!path) return null;
@@ -131,7 +133,8 @@ export async function makeWeaponModel(
     attached ? { flipForward: false, scale: 1 } : {},
   );
   root.name = `weapon:${info.id}`;
-  applyWeaponMaterials(model, info.kind);
+  const map = opts.skinKey ? await loadPreviewTexture(bundleSkinPath(bundle, opts.skinKey)) : null;
+  applyWeaponMaterials(model, info.kind, map);
 
   // Measured while `root` is still unparented, so these are in root's own space.
   const bounds = meshBounds(root);
@@ -257,21 +260,22 @@ function applyWorldRotationAround(obj: THREE.Object3D, pivot: THREE.Vector3, rot
  * `weapon` bone's +Z is *up* in idle, so aiming that at the camera swings
  * the gun out of the hands.
  *
- * Knives: `ag1` is the guard. Seat the handle in the fist after attaching.
+ * Knives: idle wraps the fingers around `wpn`, same as pistols. `ag1` is the
+ * guard — parenting that to the palm left the blade floating. Align the weapon
+ * bone and only slide the handle if the guard is still clearly in front.
+ *
+ * Nades and C4: same wrap as pistols. `ag1` is a pin/spoon helper, so lining
+ * that up with `hand_R` parks the body on the wrist.
  */
 export function attachViewmodelWeapon(model: WeaponModel, target: THREE.Object3D) {
   const pistol = model.info.kind === "pistol" || model.info.kind === "taser";
   if (model.info.kind === "knife") {
-    attachWeapon(model, target, "hand");
+    attachWeapon(model, target, "weapon");
     const guide = model.handGuide ?? model.guide;
     if (guide) seatKnifeInHand(model, guide);
     return;
   }
-  if (model.info.kind === "nade" || model.info.kind === "c4") {
-    attachWeapon(model, target, "hand");
-    return;
-  }
-  if (pistol) {
+  if (model.info.kind === "nade" || model.info.kind === "c4" || pistol) {
     attachWeapon(model, target, "weapon");
     return;
   }
@@ -299,46 +303,24 @@ export function attachViewmodelWeapon(model: WeaponModel, target: THREE.Object3D
 }
 
 /**
- * `ag1_hand_r` on a knife is the guard, not the middle of the handle. Slide
- * along the blade so the handle centre sits in the palm.
+ * After a `wpn` attach the handle should already sit in the fist. Only slide
+ * along the blade when `ag1` (the guard) is still clearly in front of the palm.
  */
 function seatKnifeInHand(model: WeaponModel, guide: THREE.Object3D) {
+  const palm = model.root.parent;
+  if (!palm) return;
   model.root.updateMatrixWorld(true);
-  const grip = guide.getWorldPosition(new THREE.Vector3());
-  const tip = farthestPoint(model.root, grip);
-  const blade = tip.sub(grip);
-  if (blade.lengthSq() < 1e-8) return;
-  blade.normalize();
-  // Default-T idle points the blade along -X, which lies on the forearm. Pull
-  // it toward the camera and a little up so it sits in front of the palm.
-  if (blade.dot(new THREE.Vector3(-1, 0, 0)) > 0.75) {
-    const want = new THREE.Vector3(-0.84, 0.12, -0.53).normalize();
-    applyWorldRotationAround(model.root, grip, new THREE.Quaternion().setFromUnitVectors(blade, want));
-    model.root.updateMatrixWorld(true);
-  }
-
-  const grip2 = guide.getWorldPosition(new THREE.Vector3());
-  const tip2 = farthestPoint(model.root, grip2);
-  const along = tip2.sub(grip2);
+  palm.updateMatrixWorld(true);
+  const guard = guide.getWorldPosition(new THREE.Vector3());
+  const fist = palm.getWorldPosition(new THREE.Vector3());
+  const ahead = guard.clone().sub(fist);
+  // Guard still in front of the palm (camera looks −Z): pull the handle in.
+  if (ahead.z > -0.15) return;
+  const tip = farthestPoint(model.root, guard);
+  const along = tip.sub(guard);
   if (along.lengthSq() < 1e-8) return;
   along.normalize();
-  let pommel = 0;
-  const point = new THREE.Vector3();
-  model.root.traverse((child) => {
-    const mesh = child as THREE.Mesh;
-    if (!mesh.isMesh || !mesh.visible || !mesh.geometry) return;
-    const pos = mesh.geometry.getAttribute("position") as THREE.BufferAttribute | undefined;
-    if (!pos) return;
-    for (let i = 0; i < pos.count; i += 4) {
-      const t = point.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld).sub(grip2).dot(along);
-      if (t < pommel) pommel = t;
-    }
-  });
-  if (pommel < -0.2) {
-    applyWorldTranslation(model.root, along.multiplyScalar(-pommel * 0.62));
-  }
-  // A last half-inch toward the lens so the blade isn't glued to the forearm.
-  applyWorldTranslation(model.root, new THREE.Vector3(-0.25, 0.45, -0.7));
+  applyWorldTranslation(model.root, along.multiplyScalar(Math.min(0.9, -ahead.z * 0.35)));
 }
 
 function farthestPoint(root: THREE.Object3D, origin: THREE.Vector3) {

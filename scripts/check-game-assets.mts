@@ -26,8 +26,16 @@ import {
   PLACEHOLDER_MESH,
 } from "../src/renderer/src/lib/armsViewmodel";
 import { tipCentroid } from "../src/renderer/src/lib/weaponModels";
-import { WEAPONS, resolveWeapon, casingModel } from "../src/renderer/src/lib/weaponTable";
-import { viewmodelAnims, locomotionAnims, SHARED_ANIMS } from "../src/renderer/src/lib/assetSpec";
+import { WEAPONS, resolveWeapon, casingModel, allWeaponModels } from "../src/renderer/src/lib/weaponTable";
+import {
+  viewmodelAnims,
+  locomotionAnims,
+  SHARED_ANIMS,
+  AGENT_BY_TEAM,
+  FALLBACK_AGENT,
+  buildPriorityAssetSpec,
+  buildWarmAssetSpec,
+} from "../src/renderer/src/lib/assetSpec";
 
 const cache = join(process.env.LOCALAPPDATA ?? "", "cs2-reel", "assets");
 
@@ -259,6 +267,17 @@ console.log("\nanimation names");
   check("smoke uses idle_smoke", viewmodelAnims(WEAPONS.smokegrenade).includes("animation/anims/viewmodel/grenade/grenade_smokegrenade/idle_smoke"));
   check("default_t knife", viewmodelAnims(WEAPONS.knife_default_t).includes("animation/anims/viewmodel/knife/knife_default_t/idle_default_t"));
   check("elite has no shoot pose", viewmodelAnims(WEAPONS.elite).every((n) => !n.includes("shoot")));
+  const tPov = buildPriorityAssetSpec({
+    povSteamid: "1",
+    frames: [{ tick: 1, players: { "1": { weapon: "ak47", team: "T" } } }],
+  } as Parameters<typeof buildPriorityAssetSpec>[0]);
+  check("T POV exports Phoenix", Boolean(tPov.agents[AGENT_BY_TEAM.T]?.length));
+  check("T POV still gets SAS viewmodel fallback", Boolean(tPov.agents[FALLBACK_AGENT]?.length));
+
+  const warm = buildWarmAssetSpec();
+  check("warm cache lists every weapon mesh", warm.weapons.length >= allWeaponModels().length);
+  check("warm cache includes SAS viewmodel idles", (warm.agents[FALLBACK_AGENT] ?? []).some((n) => n.includes("/idle_ak")));
+  check("warm cache includes Phoenix locomotion", (warm.agents[AGENT_BY_TEAM.T] ?? []).some((n) => n.includes("/run_n_rifle")));
 
   check("locomotion is 26 clips", locomotionAnims("rifle").length === 26);
   check("locomotion covers 8 directions", locomotionAnims("rifle").filter((n) => n.includes("/run_")).length === 8);

@@ -194,6 +194,7 @@ export async function makeArmsViewmodel(
   agent: string,
   info: WeaponInfo,
   team: string,
+  skinKey = "",
 ): Promise<ArmsViewmodel | null> {
   const path = bundleAgentPath(bundle, agent);
   if (!path) return null;
@@ -201,7 +202,7 @@ export async function makeArmsViewmodel(
   // the other just delays the first real viewmodel frame.
   const [loadedAgent, weapon] = await Promise.all([
     loadAsset(path),
-    makeWeaponModel(bundle, info, { attached: true }),
+    makeWeaponModel(bundle, info, { attached: true, skinKey }),
   ]);
   let loaded = loadedAgent;
   if (loaded && !findClip(loaded.animations, info.poses.idle) && agent !== FALLBACK_AGENT) {
@@ -254,9 +255,14 @@ export async function makeArmsViewmodel(
   applyBlendedPose(bones, poses.idle, null, 0);
   model.updateMatrixWorld(true);
 
-  // Pistols: fingers wrap `wpn`. Rifles: the palm is the grip.
-  const pistol = info.kind === "pistol" || info.kind === "taser";
-  const grip = pistol ? (vm.wpnBone ?? bones.get("hand_R")) : (bones.get("hand_R") ?? vm.wpnBone);
+  // Pistols, knives and nades: fingers wrap `wpn`. Rifles: the palm is the grip.
+  const wrapWpn =
+    info.kind === "pistol" ||
+    info.kind === "taser" ||
+    info.kind === "knife" ||
+    info.kind === "nade" ||
+    info.kind === "c4";
+  const grip = wrapWpn ? (vm.wpnBone ?? bones.get("hand_R")) : (bones.get("hand_R") ?? vm.wpnBone);
   if (weapon && grip) {
     attachViewmodelWeapon(weapon, grip);
     vm.weapon = weapon;
@@ -441,6 +447,14 @@ export function placeArmsViewmodel(vm: ArmsViewmodel, camera: THREE.PerspectiveC
     if (box.max.x > right) vm.root.position.x -= box.max.x - right;
   }
   vm.root.updateMatrixWorld(true);
+
+  // Rifles sit on the crosshair if we only lift a low hand. Drop them so the
+  // sights live under the reticle the way CS2 does.
+  if (vm.info.kind === "rifle" || vm.info.kind === "sniper") {
+    vm.root.position.y -= 8;
+    vm.root.position.z -= 3;
+    vm.root.updateMatrixWorld(true);
+  }
 
   vm.root.userData.restX = vm.root.position.x;
   vm.root.userData.restY = vm.root.position.y;

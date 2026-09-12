@@ -6,6 +6,7 @@ import { PovHud } from "./PovHud";
 import { ScopeOverlay } from "./ScopeOverlay";
 import {
   cs2ToThree,
+  deathAge,
   flashAt,
   lastEquip,
   poseAt,
@@ -47,11 +48,13 @@ import {
 import { disposeTracerPool, makeGlowTexture, makeTracerPool, updateTracers, type TracerPool } from "../lib/tracers";
 import { disposeNadeFx, makeNadeFx, updateNadeFx, type NadeFx } from "../lib/nadeFx";
 import { disposeCasingPool, makeCasingPool, updateCasings, type CasingPool } from "../lib/casings";
+import { bindWorldC4Model, disposeWorldC4, makeWorldC4, updateWorldC4, type WorldC4 } from "../lib/worldC4";
 import {
   AGENT_BY_TEAM,
   FALLBACK_AGENT,
+  skinKey,
 } from "../lib/assetSpec";
-import type { AssetBundle } from "../lib/gameAssets";
+import { bundleWeaponPath, type AssetBundle } from "../lib/gameAssets";
 import {
   disposeArmsViewmodel,
   makeArmsViewmodel,
@@ -184,6 +187,8 @@ export function ClipStage({
     tracerPool: TracerPool;
     nadeFx: NadeFx;
     casings: CasingPool;
+    c4: WorldC4;
+    c4Loading: boolean;
     lastTick: number;
     arms: ArmsViewmodel | null;
     armsId: string;
@@ -235,6 +240,8 @@ export function ClipStage({
     scene.add(nadeFx.group);
     const casings = makeCasingPool();
     scene.add(casings.group);
+    const c4 = makeWorldC4();
+    scene.add(c4.group);
 
     const world = {
       renderer,
@@ -249,6 +256,8 @@ export function ClipStage({
       tracerPool,
       nadeFx,
       casings,
+      c4,
+      c4Loading: false,
       lastTick: Number.NaN,
       arms: null as ArmsViewmodel | null,
       armsId: "",
@@ -299,6 +308,7 @@ export function ClipStage({
       disposeTracerPool(world.tracerPool);
       disposeNadeFx(world.nadeFx);
       disposeCasingPool(world.casings);
+      disposeWorldC4(world.c4);
       renderer.dispose();
       host.removeChild(renderer.domElement);
       worldRef.current = null;
@@ -470,12 +480,13 @@ export function ClipStage({
       if (real) {
         const vel = velocityAt(dump.frames, tick, steamid, dump.tickrate);
         const info = resolveWeapon(pose.weapon);
-        void setPlayerWeapon(real, assets, pose.weapon);
+        void setPlayerWeapon(real, assets, pose.weapon, skinKey(pose.weapon, pose.skin, pose.paintKit));
         const own = shotsInWindow(dump.shots ?? [], tick, dump.tickrate, 0.3).filter(
           (shot) => shot.steamid === steamid,
         );
         const last = own[own.length - 1];
         const shotAge = last ? (tick - last.tick) / Math.max(dump.tickrate, 1) : null;
+        const died = deathAge(dump.frames, tick, steamid, dump.tickrate);
         updatePlayerModel(real, {
           tick,
           tickrate: dump.tickrate,
@@ -484,6 +495,7 @@ export function ClipStage({
           pitch: pose.pitch,
           duck: pose.duck ?? (pose.ducking ? 1 : 0),
           alive: pose.alive,
+          deathAge: died,
           walking: pose.walking,
           velX: vel.x,
           velY: vel.y,
@@ -505,19 +517,21 @@ export function ClipStage({
         scene.add(rig);
       }
       setRigWeapon(rig, pose.weapon);
+      const died = deathAge(dump.frames, tick, steamid, dump.tickrate);
+      const fall = pose.alive ? 0 : Math.min(1, (died ?? 10) / 0.45);
       rig.traverse((child) => {
         const mesh = child as THREE.Mesh;
         if (!mesh.isMesh) return;
-        const mat = mesh.material as THREE.MeshStandardMaterial;
+        const mat = mesh.material as THREE.MeshLambertMaterial;
         if (!mat) return;
-        mat.opacity = pose.alive ? 1 : 0.4;
+        mat.opacity = pose.alive ? 1 : 1 - 0.6 * fall;
         mat.transparent = !pose.alive;
       });
       const p = cs2ToThree(pose.x, pose.y, pose.z);
       rig.position.set(p.x, p.y, p.z);
       rig.rotation.copy(cs2BodyEuler(pose.yaw));
       setRigDucking(rig, pose.duck ?? (pose.ducking ? 1 : 0));
-      setRigDead(rig, !pose.alive);
+      setRigDead(rig, !pose.alive, died ?? 10);
       aimRig(rig, pose.alive ? pose.pitch : 0);
       animateRig(rig, pose.alive ? speedAt(dump.frames, tick, steamid, dump.tickrate) : 0, frameDt);
       rig.visible = true;
@@ -546,21 +560,23 @@ export function ClipStage({
       const info = resolveWeapon(self.weapon);
       const kind = weaponKind(self.weapon);
       const agent = AGENT_BY_TEAM[self.team] ?? FALLBACK_AGENT;
+      const painted = skinKey(self.weapon, self.skin, self.paintKit);
+      const armsToken = `${info.id}:${painted}`;
       if (
         assets &&
-        world.armsId !== info.id &&
-        world.armsLoading !== info.id &&
-        world.armsFailed !== info.id
+        world.armsId !== armsToken &&
+        world.armsLoading !== armsToken &&
+        world.armsFailed !== armsToken
       ) {
-        world.armsLoading = info.id;
-        makeArmsViewmodel(assets, agent, info, self.team).then((vm) => {
-          if (worldRef.current !== world || world.armsLoading !== info.id) {
+        world.armsLoading = armsToken;
+        makeArmsViewmodel(assets, agent, info, self.team, painted).then((vm) => {
+          if (worldRef.current !== world || world.armsLoading !== armsToken) {
             disposeArmsViewmodel(vm);
             return;
           }
           world.armsLoading = null;
           if (!vm) {
-            world.armsFailed = info.id;
+            world.armsFailed = armsToken;
             return;
           }
           if (world.arms) {
@@ -569,12 +585,12 @@ export function ClipStage({
           }
           if (!placeArmsViewmodel(vm, world.vmCamera)) {
             disposeArmsViewmodel(vm);
-            world.armsFailed = info.id;
+            world.armsFailed = armsToken;
             return;
           }
           attachMuzzleFlash(vm.weapon?.muzzle ?? vm.root);
           world.arms = vm;
-          world.armsId = info.id;
+          world.armsId = armsToken;
           world.vmScene.add(vm.root);
           if (world.viewmodel) world.viewmodel.visible = false;
         });
@@ -645,6 +661,19 @@ export function ClipStage({
     // Every player's gunfire, not just the POV's, so incoming fire is visible.
     updateTracers(world.tracerPool, dump.shots ?? [], tick, dump.tickrate, pov);
     updateCasings(world.casings, dump.shots ?? [], tick, dump.tickrate, assets);
+    if (
+      assets &&
+      assetsReady &&
+      !world.c4.real &&
+      !world.c4Loading &&
+      bundleWeaponPath(assets, resolveWeapon("c4").model)
+    ) {
+      world.c4Loading = true;
+      void bindWorldC4Model(world.c4, assets).finally(() => {
+        if (worldRef.current === world) world.c4Loading = false;
+      });
+    }
+    updateWorldC4(world.c4, dump.bombs, tick);
     updateNadeFx(
       world.nadeFx,
       {

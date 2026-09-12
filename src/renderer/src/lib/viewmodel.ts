@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { skinMaterial, sleeveMaterial } from "./assetMaterials";
 import { makeWeaponMesh, weaponKind } from "./playerRig";
 import { makeGlowTexture } from "./tracers";
 
@@ -9,9 +10,6 @@ import { makeGlowTexture } from "./tracers";
  * small space around the origin facing -Z and is positioned by
  * `placeViewmodel` rather than by hand-tuned constants.
  */
-
-const SLEEVE = 0x3d4450;
-const SKIN = 0xc4a07a;
 
 /** Distance from the viewmodel camera, in viewmodel units. */
 const DEPTH = 12;
@@ -42,8 +40,8 @@ export function makeViewmodelRig(weapon: string): THREE.Group {
   root.name = "viewmodelRig";
   root.userData.kind = weaponKind(weapon);
 
-  const sleeve = new THREE.MeshStandardMaterial({ color: SLEEVE, roughness: 0.66, metalness: 0.06 });
-  const skin = new THREE.MeshStandardMaterial({ color: SKIN, roughness: 0.82, metalness: 0 });
+  const sleeve = sleeveMaterial();
+  const skin = skinMaterial();
 
   const gun = makeWeaponMesh(weapon);
   root.add(gun);

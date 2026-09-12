@@ -18,9 +18,9 @@ import {
 const MAX_NADES = 8;
 const TRAIL = 5;
 const MAX_SMOKES = 6;
-const PUFFS = 14;
+const PUFFS = 22;
 const MAX_FIRES = 6;
-const FLAMES = 9;
+const FLAMES = 14;
 const MAX_BURSTS = 4;
 
 /** Fallback lifetimes for volumes whose expiry event fell outside the demo window. */
@@ -29,8 +29,12 @@ const FIRE_SECONDS = 7;
 const BURST_SECONDS = 0.45;
 
 /** A CS smoke fills roughly this radius. */
-const SMOKE_RADIUS = 150;
-const FIRE_RADIUS = 95;
+const SMOKE_RADIUS = 175;
+const FIRE_RADIUS = 110;
+
+const SMOKE_COLOR = 0x6a7080;
+const FIRE_CORE = 0xffe066;
+const FIRE_RIM = 0xff6a1a;
 
 const NADE_COLOR: Record<string, number> = {
   flash: 0xd8d4c4,
@@ -43,11 +47,13 @@ const NADE_COLOR: Record<string, number> = {
 export type NadeFx = {
   group: THREE.Group;
   nades: { mesh: THREE.Mesh; trail: THREE.Sprite[] }[];
-  smokes: THREE.Sprite[][];
-  fires: THREE.Sprite[][];
+  smokes: { puffs: THREE.Sprite[]; core: THREE.Mesh }[];
+  fires: { flames: THREE.Sprite[]; pool: THREE.Mesh }[];
   bursts: THREE.Sprite[];
   shared: {
     sphere: THREE.SphereGeometry;
+    core: THREE.SphereGeometry;
+    disc: THREE.CircleGeometry;
     soft: THREE.Texture;
     materials: THREE.Material[];
   };
@@ -121,11 +127,13 @@ export function makeNadeFx(): NadeFx {
   group.name = "nadeFx";
   const soft = makeSoftTexture();
   const sphere = new THREE.SphereGeometry(3.4, 10, 8);
+  const core = new THREE.SphereGeometry(1, 12, 10);
+  const disc = new THREE.CircleGeometry(1, 20);
   const materials: THREE.Material[] = [];
 
   const nades: NadeFx["nades"] = [];
   for (let i = 0; i < MAX_NADES; i += 1) {
-    const material = new THREE.MeshStandardMaterial({ color: 0x6b8f3a, roughness: 0.5 });
+    const material = new THREE.MeshLambertMaterial({ color: 0x6b8f3a });
     materials.push(material);
     const mesh = new THREE.Mesh(sphere, material);
     mesh.visible = false;
@@ -139,27 +147,50 @@ export function makeNadeFx(): NadeFx {
     nades.push({ mesh, trail });
   }
 
-  const smokes: THREE.Sprite[][] = [];
+  const smokes: NadeFx["smokes"] = [];
   for (let i = 0; i < MAX_SMOKES; i += 1) {
     const puffs: THREE.Sprite[] = [];
     for (let p = 0; p < PUFFS; p += 1) {
-      // Normal blending: additive smoke would glow instead of occluding.
-      const puff = sprite(soft, 0xb9bec6, THREE.NormalBlending, materials);
+      const puff = sprite(soft, SMOKE_COLOR, THREE.NormalBlending, materials);
       puffs.push(puff);
       group.add(puff);
     }
-    smokes.push(puffs);
+    const volume = new THREE.MeshLambertMaterial({
+      color: SMOKE_COLOR,
+      transparent: true,
+      opacity: 0,
+      depthWrite: true,
+    });
+    materials.push(volume);
+    const coreMesh = new THREE.Mesh(core, volume);
+    coreMesh.visible = false;
+    group.add(coreMesh);
+    smokes.push({ puffs, core: coreMesh });
   }
 
-  const fires: THREE.Sprite[][] = [];
+  const fires: NadeFx["fires"] = [];
   for (let i = 0; i < MAX_FIRES; i += 1) {
     const flames: THREE.Sprite[] = [];
     for (let f = 0; f < FLAMES; f += 1) {
-      const flame = sprite(soft, 0xff7a2a, THREE.AdditiveBlending, materials);
+      const color = f % 2 === 0 ? FIRE_CORE : FIRE_RIM;
+      const flame = sprite(soft, color, THREE.AdditiveBlending, materials);
       flames.push(flame);
       group.add(flame);
     }
-    fires.push(flames);
+    const poolMat = new THREE.MeshBasicMaterial({
+      color: FIRE_RIM,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    materials.push(poolMat);
+    const pool = new THREE.Mesh(disc, poolMat);
+    pool.rotation.x = -Math.PI / 2;
+    pool.visible = false;
+    group.add(pool);
+    fires.push({ flames, pool });
   }
 
   const bursts: THREE.Sprite[] = [];
@@ -169,7 +200,7 @@ export function makeNadeFx(): NadeFx {
     group.add(burst);
   }
 
-  return { group, nades, smokes, fires, bursts, shared: { sphere, soft, materials } };
+  return { group, nades, smokes, fires, bursts, shared: { sphere, core, disc, soft, materials } };
 }
 
 /** Interpolated position along a grenade's recorded flight, or null if not airborne. */
@@ -217,7 +248,7 @@ export function updateNadeFx(
     const p = cs2ToThree(at.x, at.y, at.z);
     mesh.position.set(p.x, p.y, p.z);
     mesh.visible = true;
-    (mesh.material as THREE.MeshStandardMaterial).color.setHex(
+    (mesh.material as THREE.MeshLambertMaterial).color.setHex(
       NADE_COLOR[nade.kind] ?? 0x6b8f3a,
     );
     for (let t = 0; t < TRAIL; t += 1) {
@@ -242,62 +273,76 @@ export function updateNadeFx(
     fx.nades[i].trail.forEach(hide);
   }
 
-  // Smokes: a ball of soft puffs that blooms then thins out.
+  // Smokes: a dark occluding core plus a ball of puffs that blooms then thins.
   slot = 0;
   for (const smoke of data.smokes ?? []) {
     if (slot >= MAX_SMOKES) break;
     const phase = volumePhase(smoke, tick, rate, SMOKE_SECONDS);
     if (phase === null) continue;
     const alpha = envelope(phase, 0.06, 0.18);
-    const puffs = fx.smokes[slot];
+    const { puffs, core } = fx.smokes[slot];
     const seed = smoke.id ?? smoke.tick;
     const grow = Math.min(1, phase / 0.06);
     const centre = cs2ToThree(smoke.x, smoke.y, smoke.z);
+    const radius = SMOKE_RADIUS * grow;
+    core.position.set(centre.x, centre.y + radius * 0.45, centre.z);
+    core.scale.setScalar(radius * 0.72);
+    core.visible = alpha > 0.01;
+    (core.material as THREE.MeshLambertMaterial).opacity = alpha * 0.55;
     for (let p = 0; p < PUFFS; p += 1) {
       const off = clusterOffset(seed, p);
       const puff = puffs[p];
       puff.position.set(
-        centre.x + off.x * SMOKE_RADIUS * 0.7 * grow,
-        // Sits on the ground and billows upward, not centred on the impact.
-        centre.y + (off.y * 0.35 + 0.45) * SMOKE_RADIUS * grow,
-        centre.z + off.z * SMOKE_RADIUS * 0.7 * grow,
+        centre.x + off.x * SMOKE_RADIUS * 0.75 * grow,
+        centre.y + (off.y * 0.35 + 0.5) * SMOKE_RADIUS * grow,
+        centre.z + off.z * SMOKE_RADIUS * 0.75 * grow,
       );
-      const size = SMOKE_RADIUS * (0.75 + 0.3 * off.x) * grow;
+      const size = SMOKE_RADIUS * (0.85 + 0.28 * off.x) * grow;
       puff.scale.set(size, size, 1);
       puff.visible = alpha > 0.01;
-      (puff.material as THREE.SpriteMaterial).opacity = alpha * 0.3;
+      (puff.material as THREE.SpriteMaterial).opacity = alpha * 0.72;
     }
     slot += 1;
   }
-  for (let i = slot; i < MAX_SMOKES; i += 1) fx.smokes[i].forEach(hide);
+  for (let i = slot; i < MAX_SMOKES; i += 1) {
+    fx.smokes[i].puffs.forEach(hide);
+    hide(fx.smokes[i].core);
+  }
 
-  // Molotov: flat flames near the ground, flickering off the tick.
+  // Molotov: ground pool plus yellow-core / orange-rim flames.
   slot = 0;
   for (const fire of data.fires ?? []) {
     if (slot >= MAX_FIRES) break;
     const phase = volumePhase(fire, tick, rate, FIRE_SECONDS);
     if (phase === null) continue;
     const alpha = envelope(phase, 0.08, 0.25);
-    const flames = fx.fires[slot];
+    const { flames, pool } = fx.fires[slot];
     const seed = fire.id ?? fire.tick;
     const centre = cs2ToThree(fire.x, fire.y, fire.z);
+    pool.position.set(centre.x, centre.y + 2, centre.z);
+    pool.scale.setScalar(FIRE_RADIUS);
+    pool.visible = alpha > 0.01;
+    (pool.material as THREE.MeshBasicMaterial).opacity = alpha * 0.55;
     for (let f = 0; f < FLAMES; f += 1) {
       const off = clusterOffset(seed, f);
       const flicker = 0.7 + 0.3 * Math.sin(tick * 0.4 + f * 1.7);
       const flame = flames[f];
       flame.position.set(
-        centre.x + off.x * FIRE_RADIUS,
-        centre.y + 14 + off.y * 8 + flicker * 6,
-        centre.z + off.z * FIRE_RADIUS,
+        centre.x + off.x * FIRE_RADIUS * 0.85,
+        centre.y + 18 + off.y * 10 + flicker * 10,
+        centre.z + off.z * FIRE_RADIUS * 0.85,
       );
-      const size = 46 * (0.7 + 0.3 * off.z) * flicker;
-      flame.scale.set(size, size, 1);
+      const size = (f % 2 === 0 ? 88 : 72) * (0.7 + 0.3 * off.z) * flicker;
+      flame.scale.set(size, size * 1.15, 1);
       flame.visible = alpha > 0.01;
-      (flame.material as THREE.SpriteMaterial).opacity = alpha * 0.55 * flicker;
+      (flame.material as THREE.SpriteMaterial).opacity = alpha * 0.85 * flicker;
     }
     slot += 1;
   }
-  for (let i = slot; i < MAX_FIRES; i += 1) fx.fires[i].forEach(hide);
+  for (let i = slot; i < MAX_FIRES; i += 1) {
+    fx.fires[i].flames.forEach(hide);
+    hide(fx.fires[i].pool);
+  }
 
   // HE and flashbang: one expanding shell each.
   slot = 0;
@@ -324,5 +369,7 @@ export function updateNadeFx(
 export function disposeNadeFx(fx: NadeFx) {
   for (const material of fx.shared.materials) material.dispose();
   fx.shared.sphere.dispose();
+  fx.shared.core.dispose();
+  fx.shared.disc.dispose();
   fx.shared.soft.dispose();
 }

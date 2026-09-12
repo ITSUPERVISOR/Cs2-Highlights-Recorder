@@ -36,6 +36,20 @@ import { resolveWeapon, type WeaponInfo, type WorldCategory } from "./weaponTabl
 export const ARMS_MESH = "firstperson_default_gloves_arms";
 export const SLEEVES_MESH = "firstperson_sleeves";
 
+const DEATH_FALL = 0.45;
+const DEATH_HIDE_GUN = 0.15;
+const DEATH_TIP = -1.35;
+const DEATH_SINK = 4 / METRES_TO_INCHES;
+
+function smoothstep(t: number) {
+  const x = Math.min(1, Math.max(0, t));
+  return x * x * (3 - 2 * x);
+}
+
+export function deathFallAmount(deathAge: number | null | undefined) {
+  return smoothstep((deathAge ?? 10) / DEATH_FALL);
+}
+
 const WALK_SPEED = 130;
 const RUN_SPEED = 210;
 const IDLE_SPEED = 28;
@@ -49,6 +63,7 @@ export type PlayerModel = {
   clips: THREE.AnimationClip[];
   weapon: WeaponModel | null;
   weaponId: string;
+  weaponSkin: string;
   team: string;
   agent: string;
   /** Accumulated stride in seconds, so the gait stays continuous while playing. */
@@ -118,6 +133,7 @@ export async function makePlayerModel(
     clips: animations,
     weapon: null,
     weaponId: "",
+    weaponSkin: "",
     team,
     agent,
     phase: 0,
@@ -129,20 +145,22 @@ export async function setPlayerWeapon(
   player: PlayerModel,
   bundle: AssetBundle | null,
   weapon: string,
+  skinKey = "",
 ) {
   const info = resolveWeapon(weapon);
-  if (player.weaponId === info.id && player.weapon) return;
+  if (player.weaponId === info.id && player.weaponSkin === skinKey && player.weapon) return;
   if (player.weapon) {
     player.weapon.root.removeFromParent();
     disposeWeaponModel(player.weapon);
     player.weapon = null;
   }
   player.weaponId = info.id;
+  player.weaponSkin = skinKey;
   // World clips park the rifle on `wpn`. Align the weapon bone to that, not
   // the grip helper: `ag1` → `wpn` leaves the receiver floating above the
   // right hand after the inner 180° facing flip.
   const attach = player.wpnBone ?? player.bones.get("hand_R");
-  const model = await makeWeaponModel(bundle, info, { attached: Boolean(attach) });
+  const model = await makeWeaponModel(bundle, info, { attached: Boolean(attach), skinKey });
   if (!model) return;
   if (attach) attachWeapon(model, attach, "weapon");
   else player.model.add(model.root);
@@ -192,6 +210,8 @@ export function updatePlayerModel(
     pitch: number;
     duck: number;
     alive: boolean;
+    /** Seconds since they died; null while alive. Drives the tip-over ease. */
+    deathAge?: number | null;
     walking?: boolean;
     velX: number;
     velY: number;
@@ -215,18 +235,19 @@ export function updatePlayerModel(
     enableClip(player, clipName(category, "idle"), 0, 1);
     player.mixer.update(0);
     unwindSpineLean(player);
+    const fall = deathFallAmount(opts.deathAge);
     // Tip the inner model, not the root: ClipStage writes world yaw onto the
     // root every frame, which is what left corpses standing like they went AFK.
-    player.model.rotation.x = -1.35;
+    player.model.rotation.x = DEATH_TIP * fall;
     player.model.rotation.y = Math.PI;
-    // `model` is in metres; the parent root already scales by inches. 4 here
-    // was 4 metres × 39 → corpses floated like balloons.
-    player.model.position.y = 4 / METRES_TO_INCHES;
+    player.model.position.y = DEATH_SINK * fall;
+    if (player.weapon) player.weapon.root.visible = (opts.deathAge ?? 10) < DEATH_HIDE_GUN;
     return;
   }
   player.model.rotation.x = 0;
   player.model.rotation.y = Math.PI;
   player.model.position.y = 0;
+  if (player.weapon) player.weapon.root.visible = true;
 
   const crouched = duck > 0.45;
   if (speed < IDLE_SPEED) {

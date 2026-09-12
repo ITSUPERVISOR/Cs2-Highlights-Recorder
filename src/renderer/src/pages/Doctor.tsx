@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { DoctorCheck, DoctorReport } from "../lib/types";
 import { SectionHeader } from "../components/ui";
+import { buildWarmAssetSpec } from "../lib/assetSpec";
 
 function needsToolsAction(check: DoctorCheck) {
   return check.action === "install" || check.action === "update";
@@ -12,6 +13,7 @@ export function DoctorPage() {
   const [busy, setBusy] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [installMsg, setInstallMsg] = useState<string | null>(null);
+  const [warming, setWarming] = useState(false);
 
   async function run() {
     setBusy(true);
@@ -44,6 +46,29 @@ export function DoctorPage() {
     () => (report?.checks ?? []).filter((c) => c.ok === null && c.impact),
     [report],
   );
+
+  async function warmPreviewCache() {
+    setWarming(true);
+    setInstallMsg(null);
+    setError(null);
+    try {
+      const bundle = (await window.reel.previewAssets(buildWarmAssetSpec())) as {
+        weapons?: Record<string, string>;
+        weaponsMissing?: string[];
+      };
+      const weapons = Object.keys(bundle?.weapons ?? {}).length;
+      const missing = bundle?.weaponsMissing?.length ?? 0;
+      setInstallMsg(
+        missing
+          ? `Cached ${weapons} Preview weapon models (${missing} missing from the install).`
+          : `Cached ${weapons} Preview weapon models.`,
+      );
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setWarming(false);
+    }
+  }
 
   async function installOrUpdate() {
     setInstalling(true);
@@ -83,8 +108,16 @@ export function DoctorPage() {
             )}
             <button
               type="button"
+              onClick={warmPreviewCache}
+              disabled={busy || installing || warming}
+              className="rounded-full border border-line px-4 py-2 text-sm font-medium disabled:opacity-40"
+            >
+              {warming ? "Caching weapons…" : "Cache Preview weapons"}
+            </button>
+            <button
+              type="button"
               onClick={run}
-              disabled={busy || installing}
+              disabled={busy || installing || warming}
               className="rounded-full border border-line px-4 py-2 text-sm font-medium disabled:opacity-40"
             >
               {busy ? "Checking…" : "Re-check"}

@@ -87,6 +87,8 @@ def test_frames_from_dataframe_falls_back_to_duck_boolean():
     assert pose["punchPitch"] == 0.0
     assert pose["scoped"] is False
     assert pose["place"] == ""
+    assert pose["skin"] == ""
+    assert pose["paintKit"] == 0
 
 
 def test_frames_from_dataframe_reads_duck_amount():
@@ -110,6 +112,27 @@ def test_frames_from_dataframe_reads_duck_amount():
     assert pose["punchPitch"] == -1.25
     assert pose["punchYaw"] == 0.5
     assert pose["place"] == "Banana"
+
+
+def test_frames_from_dataframe_reads_paint_kit():
+    df = pd.DataFrame(
+        [
+            {
+                "tick": 1,
+                "steamid": "76561198000000001",
+                "X": 0,
+                "Y": 0,
+                "Z": 0,
+                "active_weapon_name": "ak47",
+                "active_weapon_skin": "Asiimov",
+                "fall_back_paint_kit": 44,
+            }
+        ]
+    )
+    pose = frames_from_dataframe(df)[0]["players"]["76561198000000001"]
+    assert pose["weapon"] == "ak47"
+    assert pose["skin"] == "Asiimov"
+    assert pose["paintKit"] == 44
 
 
 def test_cache_key_changes_with_window(tmp_path: Path):
@@ -357,6 +380,52 @@ def test_smoke_expired_before_the_window_is_dropped():
     )
 
 
+def test_planted_bomb_before_the_window_is_kept():
+    """A plant outlasts a clip, so one from earlier is still on the site."""
+    parser = FakeParser(
+        {
+            "bomb_planted": pd.DataFrame(
+                [{"tick": 50, "user_steamid": ALICE, "user_X": 100.0, "user_Y": 200.0, "user_Z": 10.0}]
+            ),
+            "bomb_exploded": pd.DataFrame([{"tick": 900}]),
+        }
+    )
+    out = trajectory._bombs_in_window(parser, 400, 800, [])
+    assert len(out) == 1
+    assert out[0]["kind"] == "planted"
+    assert out[0]["tick"] == 50
+    assert out[0]["endTick"] == 900
+    assert out[0]["x"] == 100.0
+
+
+def test_dropped_bomb_picked_up_before_the_window_is_skipped():
+    parser = FakeParser(
+        {
+            "bomb_dropped": pd.DataFrame(
+                [{"tick": 50, "user_steamid": ALICE, "user_X": 1.0, "user_Y": 2.0, "user_Z": 3.0}]
+            ),
+            "bomb_pickup": pd.DataFrame([{"tick": 100}]),
+        }
+    )
+    assert trajectory._bombs_in_window(parser, 400, 800, []) == []
+
+
+def test_dropped_bomb_uses_player_pose_when_event_has_no_xyz():
+    parser = FakeParser(
+        {
+            "bomb_dropped": pd.DataFrame([{"tick": 100, "user_steamid": ALICE}]),
+            "bomb_pickup": pd.DataFrame([{"tick": 400}]),
+        }
+    )
+    frames = [{"tick": 100, "players": {ALICE: {"x": 11.0, "y": 22.0, "z": 33.0}}}]
+    out = trajectory._bombs_in_window(parser, 100, 300, frames)
+    assert len(out) == 1
+    assert out[0]["kind"] == "dropped"
+    assert out[0]["x"] == 11.0
+    assert out[0]["y"] == 22.0
+    assert out[0]["endTick"] == 400
+
+
 def test_blind_uses_per_player_duration():
     """One flashbang blinds each victim for a different length of time."""
     parser = FakeParser(
@@ -466,7 +535,7 @@ def test_resolve_map_gltf_fallback_without_viewer(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("reel_core.demo.map_assets.find_map_vpk", lambda _name: None)
     frames = [{"tick": 1, "players": {"1": {"x": 0, "y": 0, "z": 0}}}]
     path, source = resolve_map_gltf("de_dust2", frames)
-    assert source == "fallback"
+    assert source == "missing"
     assert path.is_file()
 
 
@@ -510,6 +579,7 @@ def test_oversized_cached_mesh_is_rejected(tmp_path: Path, monkeypatch):
     """The 800 MB render-geometry export must never be served to the renderer."""
     monkeypatch.setenv("CS2_REEL_HOME", str(tmp_path))
     monkeypatch.setattr(map_assets, "MAX_MESH_BYTES", 4096)
+    monkeypatch.setattr(map_assets, "find_map_vpk", lambda _name: tmp_path / "de_inferno.vpk")
     _cache_map(tmp_path, "de_inferno", {"de_inferno.glb": 99_999}, _marker())
     path, source = resolve_map_gltf("de_inferno", [])
     assert source == "fallback"
@@ -518,6 +588,7 @@ def test_oversized_cached_mesh_is_rejected(tmp_path: Path, monkeypatch):
 
 def test_stale_marker_invalidates_cache(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("CS2_REEL_HOME", str(tmp_path))
+    monkeypatch.setattr(map_assets, "find_map_vpk", lambda _name: tmp_path / "de_anubis.vpk")
     _cache_map(tmp_path, "de_anubis", {"de_anubis.glb": 2000}, _marker(kind="render", version=1))
     _, source = resolve_map_gltf("de_anubis", [])
     assert source == "fallback"
@@ -526,6 +597,7 @@ def test_stale_marker_invalidates_cache(tmp_path: Path, monkeypatch):
 def test_missing_marker_invalidates_cache(tmp_path: Path, monkeypatch):
     """Exports written before the collision switch carry no marker at all."""
     monkeypatch.setenv("CS2_REEL_HOME", str(tmp_path))
+    monkeypatch.setattr(map_assets, "find_map_vpk", lambda _name: tmp_path / "de_ancient.vpk")
     _cache_map(tmp_path, "de_ancient", {"de_ancient.glb": 2000}, None)
     _, source = resolve_map_gltf("de_ancient", [])
     assert source == "fallback"
@@ -559,3 +631,37 @@ def test_export_targets_collision_hull_and_clears_stale(tmp_path: Path, monkeypa
     assert "maps/de_train/world_physics.vmdl_c" in calls[0]
     assert "--gltf_export_materials" not in calls[0]
     assert json.loads((dest / map_assets.MARKER_NAME).read_text())["kind"] == "collision"
+
+
+def test_canonical_map_stem_aliases():
+    assert map_assets.canonical_map_stem("dust2") == "de_dust2"
+    assert map_assets.canonical_map_stem("de_dust2") == "de_dust2"
+    assert map_assets.canonical_map_stem("maps/Cache.vpk") == "de_cache"
+    assert map_assets.canonical_map_stem("office") == "cs_office"
+    assert map_assets.canonical_map_stem("ar_shoots") == "ar_shoots"
+
+
+def test_resolve_map_stem_matches_installed_prefix(monkeypatch):
+    monkeypatch.setattr(map_assets, "list_installed_maps", lambda: ["de_mirage", "cs_office", "de_cache"])
+    assert map_assets.resolve_map_stem("mirage") == "de_mirage"
+    assert map_assets.resolve_map_stem("office") == "cs_office"
+    assert map_assets.resolve_map_stem("de_unknown") == "de_unknown"
+
+
+def test_list_installed_maps_skips_preview_vpks(tmp_path: Path, monkeypatch):
+    maps = tmp_path / "game" / "csgo" / "maps"
+    maps.mkdir(parents=True)
+    (maps / "de_dust2.vpk").write_bytes(b"vpk")
+    (maps / "de_dust2_preview.vpk").write_bytes(b"vpk")
+    (maps / "de_dust2_vanity.vpk").write_bytes(b"vpk")
+    (maps / "graphics_options.vpk").write_bytes(b"vpk")
+    monkeypatch.setattr(map_assets.steam, "get_cs2_folder", lambda: tmp_path)
+    assert map_assets.list_installed_maps() == ["de_dust2"]
+
+
+def test_unknown_map_is_missing_not_silent_collision(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CS2_REEL_HOME", str(tmp_path))
+    monkeypatch.setattr(map_assets, "find_map_vpk", lambda _name: None)
+    path, source = map_assets.export_map_gltf("workshop_mystery", [])
+    assert source == "missing"
+    assert path is not None and path.name.endswith("-fallback.gltf")

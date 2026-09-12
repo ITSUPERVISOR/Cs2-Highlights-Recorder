@@ -12,7 +12,7 @@
  */
 
 import type { PreviewDump } from "./clipPlayback";
-import { casingModel, resolveWeapon, type WeaponInfo, type WorldCategory } from "./weaponTable";
+import { allWeaponModels, allWeapons, casingModel, resolveWeapon, type WeaponInfo, type WorldCategory } from "./weaponTable";
 
 export const DIRECTIONS = ["n", "ne", "e", "se", "s", "sw", "w", "nw"] as const;
 export type Direction = (typeof DIRECTIONS)[number];
@@ -26,7 +26,42 @@ export type AssetSpec = {
   weapons: string[];
   /** Agent name to the animations that agent must carry. */
   agents: Record<string, string[]>;
+  /** Paint kits that appear in the clip (`{weapon, skin, paintKit}`). */
+  skins: SkinRequest[];
+  warm?: boolean;
 };
+
+export type SkinRequest = {
+  weapon: string;
+  skin: string;
+  paintKit: number;
+};
+
+export function skinKey(weapon: string, skin?: string | null, paintKit?: number | null): string {
+  const paint = Number(paintKit || 0);
+  if (paint > 0) return String(Math.trunc(paint));
+  const slug = String(skin ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_|_$/g, "");
+  if (slug && slug !== "default" && slug !== "vanilla" && slug !== "none") return slug;
+  return "";
+}
+
+export function collectSkinRequests(dump: PreviewDump): SkinRequest[] {
+  const seen = new Map<string, SkinRequest>();
+  for (const frame of dump.frames ?? []) {
+    for (const pose of Object.values(frame.players ?? {})) {
+      const weapon = pose.weapon ?? "";
+      const info = resolveWeapon(weapon);
+      if (!info.model || info.kind === "nade" || info.kind === "c4" || info.kind === "equipment") continue;
+      const key = skinKey(weapon, pose.skin, pose.paintKit);
+      if (!key || seen.has(key)) continue;
+      seen.set(key, { weapon, skin: pose.skin ?? "", paintKit: Number(pose.paintKit || 0) });
+    }
+  }
+  return [...seen.values()];
+}
 
 export function viewmodelAnim(poseSet: string, name: string): string {
   return `animation/anims/viewmodel/${poseSet}/${name}`;
@@ -80,6 +115,7 @@ function collectWeaponNames(dump: PreviewDump): string[] {
   for (const equip of dump.equips ?? []) {
     if (equip.item) names.add(equip.item);
   }
+  if ((dump.bombs ?? []).length) names.add("c4");
   return [...names];
 }
 
@@ -127,7 +163,7 @@ export function buildPriorityAssetSpec(dump: PreviewDump): AssetSpec {
   const team = start?.team || povTeam(dump);
   const agent = AGENT_BY_TEAM[team] ?? FALLBACK_AGENT;
   const firstPerson = viewmodelAnims(info);
-  if (!weapons.length && !firstPerson.length) return { weapons: [], agents: {} };
+  if (!weapons.length && !firstPerson.length) return { weapons: [], agents: {}, skins: [] };
   const agents: Record<string, string[]> = {};
   if (firstPerson.length) {
     const poses = [...new Set(firstPerson)].sort();
@@ -136,9 +172,15 @@ export function buildPriorityAssetSpec(dump: PreviewDump): AssetSpec {
     // loader falls back to it when the team skeleton has no idle pose.
     if (agent !== FALLBACK_AGENT) agents[FALLBACK_AGENT] = poses;
   }
+  const painted = skinKey(start?.weapon ?? "", start?.skin, start?.paintKit);
+  const skins =
+    painted && info.model
+      ? [{ weapon: start?.weapon ?? "", skin: start?.skin ?? "", paintKit: Number(start?.paintKit || 0) }]
+      : [];
   return {
     weapons: weapons.sort(),
     agents,
+    skins,
   };
 }
 
@@ -179,5 +221,30 @@ export function buildAssetSpec(dump: PreviewDump): AssetSpec {
   }
   for (const agent of Object.keys(agents)) agents[agent] = [...new Set(agents[agent])].sort();
 
-  return { weapons: [...models].sort(), agents };
+  return { weapons: [...models].sort(), agents, skins: collectSkinRequests(dump) };
+}
+
+/**
+ * Prefetch every gun mesh plus SAS/Phoenix locomotion (no 4K materials).
+ *
+ * T agents often ship no viewmodel clips; SAS still gets every idle so a T POV
+ * can fall back to it, same as a live clip.
+ */
+export function buildWarmAssetSpec(): AssetSpec {
+  const models = allWeaponModels();
+  const world = (["rifle", "pistol", "knife"] as WorldCategory[]).flatMap(locomotionAnims).concat(SHARED_ANIMS);
+  const idles = new Set<string>();
+  for (const info of allWeapons()) {
+    if (info.poses.idle) idles.add(viewmodelAnim(info.poseSet, info.poses.idle));
+  }
+  const sas = [...new Set([...world, ...idles])].sort();
+  return {
+    weapons: models,
+    agents: {
+      [FALLBACK_AGENT]: sas,
+      [AGENT_BY_TEAM.T]: [...world].sort(),
+    },
+    skins: [],
+    warm: true,
+  };
 }

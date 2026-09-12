@@ -28,8 +28,14 @@ const NADES: Record<string, number> = {
   decoy: 0x9aa0a8,
 };
 
-function gunMat(color: number, metal = 0.45) {
-  return new THREE.MeshStandardMaterial({ color, roughness: 0.4, metalness: metal });
+function posterize(hex: number, bits = 5) {
+  const levels = (1 << bits) - 1;
+  const quant = (channel: number) => Math.round((Math.round((channel / 255) * levels) / levels) * 255);
+  return (quant((hex >> 16) & 255) << 16) | (quant((hex >> 8) & 255) << 8) | quant(hex & 255);
+}
+
+function gunMat(color: number) {
+  return new THREE.MeshLambertMaterial({ color: posterize(color), flatShading: true });
 }
 
 export function makeWeaponMesh(weapon: string): THREE.Group {
@@ -40,36 +46,36 @@ export function makeWeaponMesh(weapon: string): THREE.Group {
   g.userData.weapon = normalizeWeapon(weapon);
 
   if (kind === "knife") {
-    g.add(mesh(new THREE.BoxGeometry(2, 1.4, 14), gunMat(BLADE, 0.7), 0, 0, -8));
-    g.add(mesh(new THREE.BoxGeometry(2.2, 2.2, 6), gunMat(GRIP, 0.1), 0, 0, 2));
+    g.add(mesh(new THREE.BoxGeometry(2, 1.4, 14), gunMat(BLADE), 0, 0, -8));
+    g.add(mesh(new THREE.BoxGeometry(2.2, 2.2, 6), gunMat(GRIP), 0, 0, 2));
     return g;
   }
   if (kind === "nade") {
     const color = NADES[normalizeWeapon(weapon)] ?? 0x6b8f3a;
-    g.add(mesh(new THREE.SphereGeometry(3.2, 10, 8), gunMat(color, 0.2), 0, 0, -2));
+    g.add(mesh(new THREE.SphereGeometry(3.2, 10, 8), gunMat(color), 0, 0, -2));
     return g;
   }
   if (kind === "c4" || kind === "equipment") {
-    g.add(mesh(new THREE.BoxGeometry(10, 4, 8), gunMat(0x4a3a28, 0.15), 0, 0, -4));
+    g.add(mesh(new THREE.BoxGeometry(10, 4, 8), gunMat(0x4a3a28), 0, 0, -4));
     return g;
   }
   if (kind === "taser") {
-    g.add(mesh(new THREE.BoxGeometry(3, 5, 10), gunMat(0xf0c14a, 0.3), 0, 0, -4));
+    g.add(mesh(new THREE.BoxGeometry(3, 5, 10), gunMat(0xf0c14a), 0, 0, -4));
     return g;
   }
 
   const length = kind === "sniper" ? 52 : kind === "rifle" ? 38 : kind === "shotgun" ? 34 : kind === "smg" ? 26 : 16;
   const barrel = kind === "pistol" ? 10 : kind === "sniper" ? 28 : 18;
   g.add(mesh(new THREE.BoxGeometry(2.4, 3.2, length * 0.45), gunMat(GUN), 0, 0, -length * 0.22));
-  g.add(mesh(new THREE.CylinderGeometry(0.9, 0.9, barrel, 8), gunMat(STOCK, 0.6), 0, 0.4, -length * 0.45));
+  g.add(mesh(new THREE.CylinderGeometry(0.9, 0.9, barrel, 8), gunMat(STOCK), 0, 0.4, -length * 0.45));
   const mag = g.children[g.children.length - 1] as THREE.Mesh;
   mag.rotation.x = Math.PI / 2;
-  g.add(mesh(new THREE.BoxGeometry(2.2, 8, 4), gunMat(GRIP, 0.08), 0, -5, 2));
+  g.add(mesh(new THREE.BoxGeometry(2.2, 8, 4), gunMat(GRIP), 0, -5, 2));
   if (kind !== "pistol") {
     g.add(mesh(new THREE.BoxGeometry(1.6, 3.5, 10), gunMat(STOCK), 0, 1, 8));
   }
   if (kind === "sniper") {
-    g.add(mesh(new THREE.CylinderGeometry(1.4, 1.4, 8, 8), gunMat(0x1c1e22, 0.2), 0, 3.2, -8));
+    g.add(mesh(new THREE.CylinderGeometry(1.4, 1.4, 8, 8), gunMat(0x1c1e22), 0, 3.2, -8));
     (g.children[g.children.length - 1] as THREE.Mesh).rotation.x = Math.PI / 2;
   }
   return g;
@@ -105,10 +111,10 @@ type RigParts = {
  */
 export function makePlayerRig(team: string): THREE.Group {
   const color = teamColor(team);
-  const cloth = new THREE.MeshStandardMaterial({ color, roughness: 0.62, metalness: 0.08 });
-  const dark = new THREE.MeshStandardMaterial({ color: 0x1c1f24, roughness: 0.7, metalness: 0.05 });
-  const skin = new THREE.MeshStandardMaterial({ color: 0xc4a07a, roughness: 0.85, metalness: 0 });
-  const vest = new THREE.MeshStandardMaterial({ color: 0x24272d, roughness: 0.55, metalness: 0.12 });
+  const cloth = gunMat(color);
+  const dark = gunMat(0x1c1f24);
+  const skin = gunMat(0xc4a07a);
+  const vest = gunMat(0x24272d);
 
   const root = new THREE.Group();
   root.name = "player";
@@ -227,11 +233,15 @@ export function setRigDucking(rig: THREE.Group, duck: number) {
 }
 
 /** Lay dead players out on the ground so they are obvious at a glance. */
-export function setRigDead(rig: THREE.Group, dead: boolean) {
+export function setRigDead(rig: THREE.Group, dead: boolean, deathAge = 10) {
   const p = parts(rig);
   if (!p) return;
-  p.body.rotation.x = dead ? -1.35 : 0;
-  p.body.position.y = dead ? 4 : 0;
+  const t = dead ? Math.min(1, Math.max(0, deathAge / 0.45)) : 0;
+  const e = t * t * (3 - 2 * t);
+  p.body.rotation.x = -1.35 * e;
+  p.body.position.y = 4 * e;
+  const gun = (rig.userData.weapon as THREE.Group | undefined) ?? p.weapon;
+  if (gun) gun.visible = !dead || deathAge < 0.15;
 }
 
 /**

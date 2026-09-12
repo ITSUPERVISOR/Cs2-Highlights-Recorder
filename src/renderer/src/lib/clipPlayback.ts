@@ -24,10 +24,14 @@ export type PreviewPose = {
    * makes it usable: without decaying by it the camera keeps a permanent offset.
    */
   punchAge: number;
-  scoped: boolean;
-  walking: boolean;
-  /** Callout name, e.g. "Banana". */
-  place: string;
+    scoped: boolean;
+    walking: boolean;
+    /** Callout name, e.g. "Banana". */
+    place: string;
+    /** Paint kit display/internal name from the demo, when present. */
+    skin?: string;
+    /** Fallback paint kit id. 0 / omitted is vanilla. */
+    paintKit?: number;
 };
 
 export type PreviewFrame = {
@@ -99,6 +103,16 @@ export type PreviewThrow = PreviewPlayerEvent & {
   weapon?: string;
 };
 
+/** C4 on the ground or planted on a site. */
+export type PreviewBomb = {
+  kind: "dropped" | "planted";
+  tick: number;
+  endTick: number | null;
+  x: number;
+  y: number;
+  z: number;
+};
+
 export type PreviewDump = {
   tickrate: number;
   map: string;
@@ -119,8 +133,12 @@ export type PreviewDump = {
   zooms?: PreviewPlayerEvent[];
 /** Optional: absent when replaying a dump cached before throws existed. */
   throws?: PreviewThrow[];
+  /** World C4 while dropped or planted. Optional on dumps cached before schema 5. */
+  bombs?: PreviewBomb[];
   mapGltf: string | null;
   mapSource: string;
+  /** False when the local CS2 install has no VPK for this map. Optional on old dumps. */
+  mapInstalled?: boolean;
 };
 
 export function lerp(a: number, b: number, t: number) {
@@ -196,6 +214,31 @@ export function velocityAt(frames: PreviewFrame[], tick: number, steamid: string
 
 export function speedAt(frames: PreviewFrame[], tick: number, steamid: string, tickrate: number) {
   return velocityAt(frames, tick, steamid, tickrate).speed;
+}
+
+/**
+ * Seconds since this player last stood alive, or null while they are alive.
+ *
+ * Playhead-pure so scrubbing shows the fall at the right pose. A clip that
+ * opens on a corpse returns a large age so they start fully prone.
+ */
+export function deathAge(
+  frames: PreviewFrame[],
+  tick: number,
+  steamid: string,
+  tickrate: number,
+): number | null {
+  if (!frames.length) return null;
+  const pose = poseAt(frames, tick, steamid);
+  if (!pose || pose.alive) return null;
+  let lastAlive = -1;
+  for (const frame of frames) {
+    if (frame.tick > tick) break;
+    const at = frame.players[steamid];
+    if (at?.alive) lastAlive = frame.tick;
+  }
+  if (lastAlive < 0) return 10;
+  return (tick - lastAlive) / Math.max(tickrate, 1);
 }
 
 /** Clip-seconds a view punch takes to settle back to the true aim. */
@@ -352,6 +395,18 @@ export function throwAgeFromGrenades(
   }
   if (latest === null) return null;
   return (tick - latest) / Math.max(tickrate, 1);
+}
+
+/** The C4 visible at this tick, or null while it is in someone's inventory. */
+export function bombAt(bombs: PreviewBomb[] | undefined, tick: number): PreviewBomb | null {
+  if (!bombs?.length) return null;
+  let found: PreviewBomb | null = null;
+  for (const bomb of bombs) {
+    if (tick < bomb.tick) continue;
+    if (bomb.endTick != null && tick >= bomb.endTick) continue;
+    found = bomb;
+  }
+  return found;
 }
 
 /** How far through its life a volume is at `tick`, or null when it is not active. */

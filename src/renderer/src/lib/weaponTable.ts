@@ -422,3 +422,18 @@ export function casingModel(info: WeaponInfo): string | null {
   const folder = family.includes("/") ? family.split("/")[0] : family;
   return `shared/shells/${folder}/${name}_casing`;
 }
+
+/** Every exportable gun, knife, nade and casing mesh path under `weapons/models`. */
+export function allWeaponModels(): string[] {
+  const models = new Set<string>();
+  for (const info of Object.values(WEAPONS)) {
+    if (info.model) models.add(info.model);
+    const casing = casingModel(info);
+    if (casing) models.add(casing);
+  }
+  return [...models].sort();
+}
+
+export function allWeapons(): WeaponInfo[] {
+  return Object.values(WEAPONS);
+}
