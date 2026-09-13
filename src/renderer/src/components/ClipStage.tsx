@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, Component, type ErrorInfo, type ReactNode } from "react";
 import * as THREE from "three";
 import type { Kill } from "../lib/types";
 import { Crosshair } from "./Crosshair";
@@ -43,10 +43,19 @@ import {
   makeViewmodelMotion,
   makeViewmodelRig,
   placeViewmodel,
+  seatViewmodel,
   type ViewmodelMotion,
 } from "../lib/viewmodel";
+import { DEFAULT_VIEWMODEL, type ViewmodelPrefs } from "../lib/previewPrefs";
+import {
+  applyRadarTintShader,
+  loadRadarRaster,
+  loadRadarTexture,
+  makeRadarPlane,
+} from "../lib/radarMap";
 import { disposeTracerPool, makeGlowTexture, makeTracerPool, updateTracers, type TracerPool } from "../lib/tracers";
-import { disposeNadeFx, makeNadeFx, updateNadeFx, type NadeFx } from "../lib/nadeFx";
+import { disposeNadeFx, makeNadeFx, updateNadeFx, bindNadeModels, type NadeFx } from "../lib/nadeFx";
+import { disposeDamageFx, makeDamageFx, updateDamageFx, damagePopsForDump, type DamageFx, type DamagePop } from "../lib/damageFx";
 import { disposeCasingPool, makeCasingPool, updateCasings, type CasingPool } from "../lib/casings";
 import { bindWorldC4Model, disposeWorldC4, makeWorldC4, updateWorldC4, type WorldC4 } from "../lib/worldC4";
 import {
@@ -92,11 +101,14 @@ export type MapStatus = "loading" | "ready" | "failed" | "mismatch";
 
 type Props = {
   dump: PreviewDump | null;
+  clipId?: string | null;
   tick: number;
   kills: Kill[];
   assets?: AssetBundle | null;
   /** False during the first asset wave so third-person models wait for locomotion. */
   assetsReady?: boolean;
+  vmPrefs?: ViewmodelPrefs;
+  mapRev?: number;
   onMapStatus?: (status: MapStatus) => void;
   onArmsStatus?: (status: ArmsStatus) => void;
 };
@@ -153,6 +165,96 @@ function eyeHeight(pose: PreviewPose) {
   return EYE + (DUCK_EYE - EYE) * Math.min(1, Math.max(0, duck));
 }
 
+type ClipActors = {
+  players: Map<string, THREE.Group>;
+  realPlayers: Map<string, PlayerModel>;
+  playerLoading: Set<string>;
+  arms: ArmsViewmodel | null;
+  armsId: string;
+  armsLoading: string | null;
+  armsFailed: string;
+  armsStatus: ArmsStatus;
+  viewmodel: THREE.Group | null;
+  damagePops: DamagePop[];
+  lastTick: number;
+};
+
+const CLIP_ACTOR_LIMIT = 6;
+
+function snapshotActors(world: {
+  players: Map<string, THREE.Group>;
+  realPlayers: Map<string, PlayerModel>;
+  playerLoading: Set<string>;
+  arms: ArmsViewmodel | null;
+  armsId: string;
+  armsLoading: string | null;
+  armsFailed: string;
+  armsStatus: ArmsStatus;
+  viewmodel: THREE.Group | null;
+  damagePops: DamagePop[];
+  lastTick: number;
+}): ClipActors {
+  return {
+    players: world.players,
+    realPlayers: world.realPlayers,
+    playerLoading: world.playerLoading,
+    arms: world.arms,
+    armsId: world.armsId,
+    armsLoading: world.armsLoading,
+    armsFailed: world.armsFailed,
+    armsStatus: world.armsStatus,
+    viewmodel: world.viewmodel,
+    damagePops: world.damagePops,
+    lastTick: world.lastTick,
+  };
+}
+
+function hideActors(snap: ClipActors) {
+  for (const rig of snap.players.values()) rig.visible = false;
+  for (const model of snap.realPlayers.values()) model.root.visible = false;
+  if (snap.arms) snap.arms.root.visible = false;
+  if (snap.viewmodel) snap.viewmodel.visible = false;
+}
+
+function disposeActors(snap: ClipActors) {
+  for (const rig of snap.players.values()) {
+    rig.parent?.remove(rig);
+    disposeObject(rig);
+  }
+  for (const model of snap.realPlayers.values()) {
+    model.root.parent?.remove(model.root);
+    disposePlayerModel(model);
+  }
+  if (snap.arms) {
+    snap.arms.root.parent?.remove(snap.arms.root);
+    disposeArmsViewmodel(snap.arms);
+  }
+  if (snap.viewmodel) {
+    snap.viewmodel.parent?.remove(snap.viewmodel);
+    disposeObject(snap.viewmodel);
+  }
+}
+
+function poseBoundsFromDump(dump: PreviewDump) {
+  let minX = Infinity,
+    maxX = -Infinity,
+    minY = Infinity,
+    maxY = -Infinity,
+    minZ = Infinity,
+    maxZ = -Infinity;
+  for (const frame of dump.frames) {
+    for (const pose of Object.values(frame.players)) {
+      minX = Math.min(minX, pose.x);
+      maxX = Math.max(maxX, pose.x);
+      minY = Math.min(minY, pose.y);
+      maxY = Math.max(maxY, pose.y);
+      minZ = Math.min(minZ, pose.z);
+      maxZ = Math.max(maxZ, pose.z);
+    }
+  }
+  return { minX, maxX, minY, maxY, minZ, maxZ };
+}
+
 function disposeObject(obj: THREE.Object3D) {
   obj.traverse((child: THREE.Object3D) => {
     const mesh = child as THREE.Mesh;
@@ -166,10 +268,13 @@ function disposeObject(obj: THREE.Object3D) {
 
 export function ClipStage({
   dump,
+  clipId = null,
   tick,
   kills,
   assets = null,
   assetsReady = true,
+  vmPrefs = DEFAULT_VIEWMODEL,
+  mapRev = 0,
   onMapStatus,
   onArmsStatus,
 }: Props) {
@@ -186,6 +291,8 @@ export function ClipStage({
     motion: ViewmodelMotion;
     tracerPool: TracerPool;
     nadeFx: NadeFx;
+    damageFx: DamageFx;
+    damagePops: DamagePop[];
     casings: CasingPool;
     c4: WorldC4;
     c4Loading: boolean;
@@ -198,13 +305,30 @@ export function ClipStage({
     playerLoading: Set<string>;
     assets: AssetBundle | null;
     armsStatus: ArmsStatus;
+    vmPrefs: ViewmodelPrefs;
+    clipActors: Map<string, ClipActors>;
+    activeClip: string;
   } | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({
+        antialias: false,
+        alpha: false,
+        powerPreference: "high-performance",
+      });
+    } catch {
+      host.replaceChildren();
+      const note = document.createElement("div");
+      note.className = "flex h-full items-center justify-center px-6 text-center text-sm text-muted";
+      note.textContent = "Preview lost the GPU context. Switch to Low and reopen the clip.";
+      host.appendChild(note);
+      return;
+    }
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
     renderer.setSize(host.clientWidth, host.clientHeight);
     renderer.setClearColor(0x10140f, 1);
     host.appendChild(renderer.domElement);
@@ -238,6 +362,8 @@ export function ClipStage({
     scene.add(tracerPool.group);
     const nadeFx = makeNadeFx();
     scene.add(nadeFx.group);
+    const damageFx = makeDamageFx();
+    scene.add(damageFx.group);
     const casings = makeCasingPool();
     scene.add(casings.group);
     const c4 = makeWorldC4();
@@ -255,6 +381,8 @@ export function ClipStage({
       motion: makeViewmodelMotion(),
       tracerPool,
       nadeFx,
+      damageFx,
+      damagePops: [] as DamagePop[],
       casings,
       c4,
       c4Loading: false,
@@ -267,6 +395,9 @@ export function ClipStage({
       playerLoading: new Set<string>(),
       assets: null as AssetBundle | null,
       armsStatus: "procedural" as ArmsStatus,
+      vmPrefs,
+      clipActors: new Map<string, ClipActors>(),
+      activeClip: "",
     };
     worldRef.current = world;
 
@@ -277,8 +408,14 @@ export function ClipStage({
       camera.updateProjectionMatrix();
       vmCamera.aspect = aspect;
       vmCamera.updateProjectionMatrix();
-      if (world.viewmodel) placeViewmodel(world.viewmodel, vmCamera);
-      if (world.arms) placeArmsViewmodel(world.arms, vmCamera);
+      if (world.viewmodel) {
+        placeViewmodel(world.viewmodel, vmCamera);
+        seatViewmodel(world.viewmodel, world.vmPrefs);
+      }
+      if (world.arms) {
+        placeArmsViewmodel(world.arms, vmCamera);
+        seatViewmodel(world.arms.root, world.vmPrefs);
+      }
       renderer.setSize(host.clientWidth, host.clientHeight);
     };
     const observer = new ResizeObserver(onResize);
@@ -305,12 +442,14 @@ export function ClipStage({
       if (world.viewmodel) disposeObject(world.viewmodel);
       disposeArmsViewmodel(world.arms);
       for (const player of world.realPlayers.values()) disposePlayerModel(player);
+      for (const snap of world.clipActors.values()) disposeActors(snap);
       disposeTracerPool(world.tracerPool);
       disposeNadeFx(world.nadeFx);
+      disposeDamageFx(world.damageFx);
       disposeCasingPool(world.casings);
       disposeWorldC4(world.c4);
       renderer.dispose();
-      host.removeChild(renderer.domElement);
+      if (renderer.domElement.parentNode === host) host.removeChild(renderer.domElement);
       worldRef.current = null;
     };
   }, []);
@@ -319,36 +458,32 @@ export function ClipStage({
     const world = worldRef.current;
     if (!world) return;
     const { scene } = world;
-    const old = scene.getObjectByName("mapRoot");
+    const mapKey = dump ? `${dump.mapGltf ?? ""}|${dump.mapSource ?? ""}|${dump.radar?.image ?? ""}` : "";
+    const old = scene.getObjectByName("mapRoot") as THREE.Group | undefined;
+    if (old && dump?.frames.length && old.userData.mapKey === mapKey) {
+      old.userData.poseBounds = poseBoundsFromDump(dump);
+      return;
+    }
+    let keepMesh: THREE.Object3D | null = null;
     if (old) {
-      // Detach the cached map mesh first: disposing it would free geometry the
-      // module cache still hands out.
-      const cached = old.getObjectByName("mapMesh");
-      if (cached && isCachedMapMesh(cached)) old.remove(cached);
+      const mesh = old.getObjectByName("mapMesh");
+      if (mesh) {
+        old.remove(mesh);
+        keepMesh = mesh.userData.mapKey === mapKey ? mesh : null;
+        if (mesh !== keepMesh) {
+          const plane = mesh.getObjectByName("radarPlane");
+          if (plane) {
+            mesh.remove(plane);
+            disposeObject(plane);
+          }
+        }
+      }
       disposeObject(old);
       scene.remove(old);
     }
     if (!dump?.frames.length) return;
 
-    const root = new THREE.Group();
-    root.name = "mapRoot";
-
-    let minX = Infinity,
-      maxX = -Infinity,
-      minY = Infinity,
-      maxY = -Infinity,
-      minZ = Infinity,
-      maxZ = -Infinity;
-    for (const frame of dump.frames) {
-      for (const pose of Object.values(frame.players)) {
-        minX = Math.min(minX, pose.x);
-        maxX = Math.max(maxX, pose.x);
-        minY = Math.min(minY, pose.y);
-        maxY = Math.max(maxY, pose.y);
-        minZ = Math.min(minZ, pose.z);
-        maxZ = Math.max(maxZ, pose.z);
-      }
-    }
+    const { minX, maxX, minY, maxY, minZ, maxZ } = poseBoundsFromDump(dump);
     const pad = 900;
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
@@ -356,6 +491,10 @@ export function ClipStage({
     const depth = Math.max(400, maxY - minY + pad * 2);
     const groundZ = Number.isFinite(minZ) ? minZ - 4 : 0;
     const center = cs2ToThree(cx, cy, groundZ);
+
+    const root = new THREE.Group();
+    root.name = "mapRoot";
+    root.userData.mapKey = mapKey;
 
     const ground = new THREE.Mesh(
       new THREE.BoxGeometry(width, 8, depth),
@@ -369,48 +508,139 @@ export function ClipStage({
     grid.name = "fallbackGrid";
     grid.position.copy(ground.position);
     root.add(grid);
+    root.userData.poseBounds = { minX, maxX, minY, maxY, minZ, maxZ };
 
     scene.add(root);
+    if (keepMesh) {
+      keepMesh.name = "mapMesh";
+      root.add(keepMesh);
+      ground.visible = false;
+      grid.visible = false;
+    }
+  }, [dump?.startTick, dump?.endTick, dump?.frames.length, dump?.povSteamid, dump?.mapGltf, dump?.mapSource, dump?.radar?.image]);
+
+  useEffect(() => {
+    const world = worldRef.current;
+    if (!world || !dump) return;
+    const root = world.scene.getObjectByName("mapRoot") as THREE.Group | undefined;
+    if (!root) return;
+    const bounds = root.userData.poseBounds as
+      | { minX: number; maxX: number; minY: number; maxY: number; minZ: number; maxZ: number }
+      | undefined;
+    if (!bounds) return;
+    const ground = root.getObjectByName("fallbackGround") as THREE.Mesh | undefined;
+    const grid = root.getObjectByName("fallbackGrid");
+    const meshSources = dump.mapSource === "collision" || dump.mapSource === "radar";
+    if (!dump.mapGltf || !meshSources) return;
+
+    const mapKey = `${dump.mapGltf}|${dump.mapSource}|${dump.radar?.image ?? ""}`;
+    const existing = root.getObjectByName("mapMesh");
+    if (existing?.userData.mapKey === mapKey) {
+      onMapStatus?.("ready");
+      return;
+    }
+
+    const hadMesh = Boolean(existing);
+    if (!hadMesh) onMapStatus?.("loading");
 
     let cancelled = false;
-    if (dump.mapGltf && dump.mapSource === "collision") {
-      onMapStatus?.("loading");
-      loadMapGltf(dump.mapGltf).then((mesh) => {
-        if (cancelled || worldRef.current?.scene !== scene) {
-          if (mesh && !isCachedMapMesh(mesh)) disposeObject(mesh);
-          return;
-        }
-        if (!mesh) {
-          onMapStatus?.("failed");
-          return;
-        }
-        if (mesh.parent) mesh.parent.remove(mesh);
-        mesh.name = "mapMesh";
-        flattenMaterials(mesh);
-        const poseBox = poseBoundsToThree({ minX, maxX, minY, maxY, minZ, maxZ });
+    const source = dump.mapSource;
+    const radar = dump.radar;
+    const { minX, maxX, minY, maxY, minZ, maxZ } = bounds;
+    loadMapGltf(dump.mapGltf).then(async (loaded) => {
+      if (cancelled || worldRef.current?.scene !== world.scene) {
+        if (loaded && !isCachedMapMesh(loaded)) disposeObject(loaded);
+        return;
+      }
+      if (!loaded) {
+        if (!hadMesh) onMapStatus?.("failed");
+        return;
+      }
+      if (loaded.parent) loaded.parent.remove(loaded);
+      let mesh: THREE.Object3D = loaded;
+      let fitted = false;
+      const poseBox = poseBoundsToThree({ minX, maxX, minY, maxY, minZ, maxZ });
+      if (source === "radar" && radar) {
+        // Clone the hierarchy only. Sharing geometry avoids a second copy of the
+        // collision hull, which is what blew the D3D11 budget (GL_OUT_OF_MEMORY).
+        mesh = loaded.clone(true);
+        mesh.userData.cached = false;
+        mesh.traverse((child) => {
+          if (child.userData) delete child.userData.cached;
+        });
         const fit = fitMapMesh(mesh, poseBox);
         if (fit === "mismatch") {
-          // Keep the fallback floor: the mesh exists but sits nowhere near the clip.
+          if (!hadMesh) onMapStatus?.("mismatch");
+          return;
+        }
+        fitted = true;
+        const tex = await loadRadarTexture(radar.image);
+        if (cancelled || worldRef.current?.scene !== world.scene) return;
+        if (tex) applyRadarTintShader(mesh, radar, tex);
+        const upper = await loadRadarRaster(radar.image);
+        if (cancelled || worldRef.current?.scene !== world.scene) return;
+        if (upper) {
+          const plane = await makeRadarPlane(radar, upper, poseBox.min.y + 1);
+          if (cancelled || worldRef.current?.scene !== world.scene) return;
+          if (plane) mesh.add(plane);
+        }
+      } else {
+        flattenMaterials(loaded);
+      }
+      mesh.name = "mapMesh";
+      mesh.userData.mapKey = mapKey;
+      if (!fitted) {
+        const fit = fitMapMesh(mesh, poseBox);
+        if (fit === "mismatch") {
           console.warn(
             `[preview] map mesh does not overlap the clip. mesh ${describeBox(
               new THREE.Box3().setFromObject(mesh),
             )} poses ${describeBox(poseBox)}`,
           );
-          if (!isCachedMapMesh(mesh)) disposeObject(mesh);
-          onMapStatus?.("mismatch");
+          if (!hadMesh) onMapStatus?.("mismatch");
           return;
         }
-        root.add(mesh);
-        ground.visible = false;
-        grid.visible = false;
-        onMapStatus?.("ready");
-      });
-    }
+      }
+      const prev = root.getObjectByName("mapMesh");
+      if (prev && prev !== mesh) {
+        const plane = prev.getObjectByName("radarPlane");
+        if (plane) {
+          prev.remove(plane);
+          disposeObject(plane);
+        }
+        if (isCachedMapMesh(prev)) root.remove(prev);
+        else root.remove(prev);
+      }
+      if (mesh.parent !== root) root.add(mesh);
+      if (ground) ground.visible = false;
+      if (grid) grid.visible = false;
+      onMapStatus?.("ready");
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [dump?.mapGltf, dump?.mapSource, dump?.frames.length, onMapStatus]);
+  }, [dump?.mapGltf, dump?.mapSource, dump?.radar?.image, mapRev, onMapStatus]);
+
+  useEffect(() => {
+    const world = worldRef.current;
+    if (!world) return;
+    const prevFov = world.vmPrefs.fov;
+    world.vmPrefs = vmPrefs;
+    if (Math.abs(world.vmCamera.fov - vmPrefs.fov) > 0.05) {
+      world.vmCamera.fov = vmPrefs.fov;
+      world.vmCamera.updateProjectionMatrix();
+    }
+    const replace = Math.abs(prevFov - vmPrefs.fov) > 0.05;
+    if (world.arms) {
+      if (replace) placeArmsViewmodel(world.arms, world.vmCamera);
+      seatViewmodel(world.arms.root, vmPrefs);
+    }
+    if (world.viewmodel) {
+      if (replace) placeViewmodel(world.viewmodel, world.vmCamera);
+      seatViewmodel(world.viewmodel, vmPrefs);
+    }
+  }, [vmPrefs]);
 
   useEffect(() => {
     const world = worldRef.current;
@@ -418,21 +648,68 @@ export function ClipStage({
     world.assets = assets ?? null;
     // A later wave adds paths; keep a working viewmodel and retry anything that failed.
     world.armsFailed = "";
-  }, [assets]);
+    if (assets && dump) {
+      const kinds = [...new Set((dump.grenades ?? []).map((nade) => nade.kind).filter(Boolean))];
+      bindNadeModels(world.nadeFx, assets, kinds.length ? kinds : ["he", "flash", "smoke", "molotov", "decoy"]);
+    }
+  }, [assets, dump?.startTick, dump?.grenades]);
 
   useEffect(() => {
     const world = worldRef.current;
-    if (!world) return;
-    disposeArmsViewmodel(world.arms);
+    if (world && dump) world.damagePops = damagePopsForDump(dump);
+  }, [dump]);
+
+  useEffect(() => {
+    const world = worldRef.current;
+    if (!world || !clipId) return;
+    if (world.activeClip === clipId) return;
+
+    if (world.activeClip) {
+      const snap = snapshotActors(world);
+      hideActors(snap);
+      world.clipActors.set(world.activeClip, snap);
+    }
+
+    const hit = world.clipActors.get(clipId);
+    if (hit) {
+      world.clipActors.delete(clipId);
+      world.players = hit.players;
+      world.realPlayers = hit.realPlayers;
+      world.playerLoading = hit.playerLoading;
+      world.arms = hit.arms;
+      world.armsId = hit.armsId;
+      world.armsLoading = hit.armsLoading;
+      world.armsFailed = hit.armsFailed;
+      world.armsStatus = hit.armsStatus;
+      world.viewmodel = hit.viewmodel;
+      world.damagePops = hit.damagePops;
+      world.lastTick = Number.NaN;
+      world.activeClip = clipId;
+      onArmsStatus?.(hit.armsStatus);
+      return;
+    }
+
+    world.players = new Map();
+    world.realPlayers = new Map();
+    world.playerLoading = new Set();
     world.arms = null;
     world.armsId = "";
     world.armsLoading = null;
     world.armsFailed = "";
     world.armsStatus = "procedural";
-    for (const player of world.realPlayers.values()) disposePlayerModel(player);
-    world.realPlayers.clear();
-    world.playerLoading.clear();
-  }, [dump?.startTick, dump?.endTick, dump?.povSteamid]);
+    world.viewmodel = null;
+    world.damagePops = [];
+    world.lastTick = Number.NaN;
+    world.activeClip = clipId;
+
+    while (world.clipActors.size >= CLIP_ACTOR_LIMIT) {
+      const oldest = world.clipActors.keys().next().value as string | undefined;
+      if (!oldest) break;
+      const evicted = world.clipActors.get(oldest);
+      world.clipActors.delete(oldest);
+      if (evicted) disposeActors(evicted);
+    }
+  }, [clipId, onArmsStatus]);
 
   useEffect(() => {
     const world = worldRef.current;
@@ -588,6 +865,7 @@ export function ClipStage({
             world.armsFailed = armsToken;
             return;
           }
+          seatViewmodel(vm.root, world.vmPrefs);
           attachMuzzleFlash(vm.weapon?.muzzle ?? vm.root);
           world.arms = vm;
           world.armsId = armsToken;
@@ -644,6 +922,7 @@ export function ClipStage({
           world.viewmodel = makeViewmodelRig(self.weapon);
           world.vmScene.add(world.viewmodel);
           placeViewmodel(world.viewmodel, world.vmCamera);
+          seatViewmodel(world.viewmodel, world.vmPrefs);
         }
         world.viewmodel.visible = !hideVm;
         animateViewmodel(world.viewmodel, world.motion, {
@@ -685,6 +964,7 @@ export function ClipStage({
       tick,
       dump.tickrate,
     );
+    updateDamageFx(world.damageFx, world.damagePops, tick, dump.tickrate);
 
     for (const line of world.traces) {
       line.geometry.dispose();
@@ -736,4 +1016,27 @@ export function ClipStage({
       )}
     </div>
   );
+}
+
+export class ClipStageBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("ClipStage crashed", error, info);
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="flex h-full items-center justify-center px-6 text-center text-sm text-muted">
+          Preview lost the GPU context. Switch to Low and pick the clip again.
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }

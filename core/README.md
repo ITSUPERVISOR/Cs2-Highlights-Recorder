@@ -17,7 +17,8 @@ HLAE, FFmpeg and CS Demo Manager's MIT `server.dll` are fetched from current Git
 
 ## Preview notes
 
-- Pose dumps, collision hulls, and weapon/agent GLBs go under `%LOCALAPPDATA%\cs2-reel\`. Nothing from the CS2 VPK is committed.
+- Pose dumps, collision hulls, radar overlays, and weapon/agent GLBs go under `%LOCALAPPDATA%\cs2-reel\`. Nothing from the CS2 VPK is committed.
+- Preview qualities: **Low** collision hull, **Medium / High** hull + local radar tint. High does not export the Source 2 world mesh (too large for WebGL). `preview-map MAP --quality low|medium|high`. Unused `maps/*/high` world dumps are pruned on export.
 - `--warm` prefetches every gun mesh plus SAS/Phoenix locomotion. `--skins-all` bakes paint kits at 64px (never 4K).
 - A map that is not in the install gets a flat fallback, not a silent empty scene.
 

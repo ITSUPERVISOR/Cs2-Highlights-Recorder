@@ -53,6 +53,8 @@ export type PreviewShot = {
   /** How far the bullet travelled, when it hit someone. */
   dist: number | null;
   victim: string | null;
+  /** HP dealt, when `bullet_damage` / `player_hurt` recorded it. Optional on old dumps. */
+  damage?: number | null;
 };
 
 export type PreviewNade = {
@@ -139,6 +141,17 @@ export type PreviewDump = {
   mapSource: string;
   /** False when the local CS2 install has no VPK for this map. Optional on old dumps. */
   mapInstalled?: boolean;
+  /** Radar overlay for medium quality. Absent on low / high / old dumps. */
+  radar?: {
+    image: string;
+    lower?: string | null;
+    posX: number;
+    posY: number;
+    scale: number;
+    altitudeSplit?: number | null;
+  } | null;
+  /** Why a higher quality tier fell back, e.g. `high failed, using medium`. */
+  mapError?: string | null;
 };
 
 export function lerp(a: number, b: number, t: number) {

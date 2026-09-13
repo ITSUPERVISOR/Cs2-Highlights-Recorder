@@ -12,7 +12,7 @@ import { makeGlowTexture } from "./tracers";
  */
 
 /** Distance from the viewmodel camera, in viewmodel units. */
-const DEPTH = 12;
+export const VIEWMODEL_DEPTH = 12;
 /** Roughly how many units tall the rig is, used to scale it into the frustum. */
 const VM_UNITS = 26;
 
@@ -94,12 +94,37 @@ export function makeViewmodelRig(weapon: string): THREE.Group {
  * both shrink the gun and fling it past the right edge.
  */
 export function placeViewmodel(root: THREE.Object3D, camera: THREE.PerspectiveCamera) {
-  const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * DEPTH;
+  const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * VIEWMODEL_DEPTH;
   const halfW = halfH * Math.max(camera.aspect, 0.0001);
-  root.userData.restX = Math.min(halfH * 0.75, halfW * 0.45);
-  root.userData.restY = -halfH * 0.5;
-  root.position.set(root.userData.restX, root.userData.restY, -DEPTH);
+  const nade = (root.userData.kind as string) === "nade";
+  root.userData.restX = Math.min(halfH * (nade ? 0.88 : 0.75), halfW * (nade ? 0.58 : 0.45));
+  root.userData.restY = -halfH * (nade ? 0.62 : 0.5);
+  root.userData.restZ = -VIEWMODEL_DEPTH;
+  root.position.set(root.userData.restX, root.userData.restY, root.userData.restZ);
   root.scale.setScalar(halfH / VM_UNITS);
+  captureViewmodelRest(root);
+}
+
+/** Snapshot the rest pose produced by `placeViewmodel` / `placeArmsViewmodel`. */
+export function captureViewmodelRest(root: THREE.Object3D) {
+  root.userData.placedX = root.userData.restX ?? 0;
+  root.userData.placedY = root.userData.restY ?? 0;
+  root.userData.placedZ = root.userData.restZ ?? 0;
+  root.userData.baseScale = root.scale.x || 1;
+}
+
+/** Offset / scale applied on top of the captured rest pose. Does not remount. */
+export function seatViewmodel(
+  root: THREE.Object3D,
+  prefs: { x: number; y: number; z: number; scale: number },
+) {
+  if (typeof root.userData.placedX !== "number") captureViewmodelRest(root);
+  root.userData.restX = root.userData.placedX + prefs.x;
+  root.userData.restY = root.userData.placedY + prefs.y;
+  root.userData.restZ = root.userData.placedZ + prefs.z;
+  const base = typeof root.userData.baseScale === "number" ? root.userData.baseScale : root.scale.x || 1;
+  root.scale.setScalar(base * prefs.scale);
+  root.position.set(root.userData.restX, root.userData.restY, root.userData.restZ);
 }
 
 export type ViewmodelMotion = {
@@ -164,7 +189,7 @@ export function animateViewmodel(
   // holds up at any viewport size.
   root.position.x = (root.userData.restX ?? 0) + bobX;
   root.position.y = (root.userData.restY ?? 0) + bobY - recoil * scale * 0.012;
-  root.position.z = -DEPTH + recoil * scale * 0.05;
+  root.position.z = (root.userData.restZ ?? -VIEWMODEL_DEPTH) + recoil * scale * 0.05;
 
   const lagYaw = THREE.MathUtils.clamp(dYaw, -12, 12);
   const lagPitch = THREE.MathUtils.clamp(pitch - motion.swayPitch, -12, 12);

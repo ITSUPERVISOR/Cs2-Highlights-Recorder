@@ -195,7 +195,15 @@ def test_shots_join_weapon_name_and_hit_distance():
                 ]
             ),
             "bullet_damage": pd.DataFrame(
-                [{"tick": 100, "attacker_steamid": ALICE, "victim_steamid": BOB, "distance": 812.5}]
+                [
+                    {
+                        "tick": 100,
+                        "attacker_steamid": ALICE,
+                        "victim_steamid": BOB,
+                        "distance": 812.5,
+                        "dmg_health": 27,
+                    }
+                ]
             ),
         }
     )
@@ -209,6 +217,7 @@ def test_shots_join_weapon_name_and_hit_distance():
     assert hit["yaw"] == 170.0
     assert hit["dist"] == 812.5
     assert hit["victim"] == BOB
+    assert hit["damage"] == 27
     # A miss has no recorded distance, so the renderer draws a long streak.
     assert miss["dist"] is None
     assert miss["victim"] is None
@@ -665,3 +674,162 @@ def test_unknown_map_is_missing_not_silent_collision(tmp_path: Path, monkeypatch
     path, source = map_assets.export_map_gltf("workshop_mystery", [])
     assert source == "missing"
     assert path is not None and path.name.endswith("-fallback.gltf")
+
+
+def test_parse_overview_txt_reads_cs_convention():
+    text = """
+    "de_dust2"
+    {
+        "material"  "overviews/de_dust2"
+        "pos_x"     "-2476"
+        "pos_y"     "3239"
+        "scale"     "4.4"
+        "rotate"    "0"
+    }
+    """
+    overview = map_assets.parse_overview_txt(text)
+    assert overview is not None
+    assert overview["pos_x"] == -2476
+    assert overview["pos_y"] == 3239
+    assert overview["scale"] == 4.4
+
+
+def test_parse_overview_txt_reads_nuke_lower_split():
+    text = """
+    "de_nuke"
+    {
+        "pos_x" "-3000"
+        "pos_y" "2500"
+        "scale" "6"
+        "verticalsections"
+        {
+            "default"
+            {
+                "AltitudeMin" "-10000"
+                "AltitudeMax" "-480"
+            }
+            "lower"
+            {
+                "AltitudeMin" "-480"
+                "AltitudeMax" "10000"
+            }
+        }
+    }
+    """
+    overview = map_assets.parse_overview_txt(text)
+    assert overview is not None
+    assert overview["altitude_split"] == -480
+
+
+def test_drop_prop_like_nodes_keeps_world():
+    gltf = {
+        "nodes": [
+            {"name": "world", "children": [1, 2]},
+            {"name": "brush_floor"},
+            {"name": "prop_static_plant", "children": [3]},
+            {"name": "prop_static_leaf"},
+        ],
+        "scenes": [{"nodes": [0, 2]}],
+    }
+    dropped = map_assets.drop_prop_like_nodes(gltf)
+    assert dropped >= 2
+    assert gltf["nodes"][0]["children"] == [1]
+    assert gltf["scenes"][0]["nodes"] == [0]
+
+
+def test_world64_postprocess_drops_props_and_caps_png(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CS2_REEL_HOME", str(tmp_path))
+    dest = tmp_path / "high"
+    dest.mkdir()
+    gltf = dest / "world.gltf"
+    doc = {
+        "asset": {"version": "2.0"},
+        "nodes": [{"name": "static_world"}, {"name": "prop_static_crate"}],
+        "scenes": [{"nodes": [0, 1]}],
+    }
+    gltf.write_text(json.dumps(doc) + (" " * 1500), encoding="utf-8")
+    from PIL import Image
+
+    albedo = dest / "albedo.png"
+    Image.new("RGB", (256, 256), (12, 24, 36)).save(albedo)
+    found = map_assets._postprocess_world64(dest)
+    assert found == gltf
+    rewritten = json.loads(gltf.read_text(encoding="utf-8"))
+    assert rewritten["scenes"][0]["nodes"] == [0]
+    with Image.open(albedo) as image:
+        assert max(image.size) <= 64
+
+
+def test_export_high_uses_radar_not_world_mesh(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CS2_REEL_HOME", str(tmp_path))
+    dest = _cache_map(tmp_path, "de_train", {"de_train_physics.glb": 2000}, _marker())
+    radar_dir = tmp_path / "maps" / "de_train" / "medium"
+    radar_dir.mkdir(parents=True)
+    png = radar_dir / "radar.png"
+    png.write_bytes(b"png")
+    vpk = tmp_path / "de_train.vpk"
+    vpk.write_bytes(b"vpk")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(map_assets, "find_map_vpk", lambda _name: vpk)
+    monkeypatch.setattr(
+        map_assets,
+        "extract_radar_overlay",
+        lambda *_a, **_k: {
+            "image": str(png),
+            "lower": None,
+            "posX": -1.0,
+            "posY": 2.0,
+            "scale": 4.4,
+            "altitudeSplit": None,
+        },
+    )
+    monkeypatch.setattr(map_assets, "_run_viewer", lambda args, **_k: calls.append(list(args)))
+
+    payload = map_assets.export_map_preview("de_train", [], quality="high")
+    assert payload["mapSource"] == "radar"
+    assert payload["mapGltf"] == str(dest / "de_train_physics.glb")
+    assert payload["radar"]["image"] == str(png)
+    assert not any("--gltf_export_materials" in call for call in calls)
+    assert not (tmp_path / "maps" / "de_train" / "high").exists()
+
+
+def test_export_medium_attaches_radar(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CS2_REEL_HOME", str(tmp_path))
+    dest = _cache_map(tmp_path, "de_mirage", {"de_mirage_physics.glb": 2000}, _marker())
+    radar_dir = tmp_path / "maps" / "de_mirage" / "medium"
+    radar_dir.mkdir(parents=True)
+    png = radar_dir / "radar.png"
+    png.write_bytes(b"png")
+    monkeypatch.setattr(
+        map_assets,
+        "extract_radar_overlay",
+        lambda *_a, **_k: {
+            "image": str(png),
+            "lower": None,
+            "posX": -1.0,
+            "posY": 2.0,
+            "scale": 4.4,
+            "altitudeSplit": None,
+        },
+    )
+    payload = map_assets.export_map_preview("de_mirage", [], quality="medium")
+    assert payload["mapSource"] == "radar"
+    assert payload["radar"]["image"] == str(png)
+    assert payload["mapGltf"] == str(dest / "de_mirage_physics.glb")
+
+
+def test_prune_preview_junk_drops_high_world_dumps(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CS2_REEL_HOME", str(tmp_path))
+    high = tmp_path / "maps" / "de_cache" / "high" / "maps"
+    high.mkdir(parents=True)
+    (high / "world.bin").write_bytes(b"x" * 4096)
+    stub = tmp_path / "maps" / "de_cache" / "de_cache.glb"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    stub.write_bytes(b"glTF")
+    keep = tmp_path / "maps" / "de_cache" / "de_cache_physics.glb"
+    keep.write_bytes(b"glTF" + b"\0" * 2000)
+    result = map_assets.prune_preview_junk()
+    assert not (tmp_path / "maps" / "de_cache" / "high").exists()
+    assert not stub.exists()
+    assert keep.is_file()
+    assert result["freedBytes"] >= 4096

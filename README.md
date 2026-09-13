@@ -27,7 +27,13 @@ First launch: open **Doctor**, confirm SteamID, **Scan folders**, click a demo t
 
 **Preview** replays a waiting clip in-app as a pose dump — not HLAE, and not a video file. Scrubbing is playhead-pure: guns, nades, flashes, planted/dropped C4, and death falls follow the demo tick.
 
-It reads models from your local CS2 install (Source2Viewer → `%LOCALAPPDATA%\cs2-reel\`). Collision hulls stay untextured. Weapon skins are 64px nearest albedos, never native 4K.
+It reads models from your local CS2 install (Source2Viewer → `%LOCALAPPDATA%\cs2-reel\`). Preview quality is remembered (first launch is **Low**):
+
+- **Low** — untextured collision hull
+- **Medium / High** — that hull tinted from the local radar overlay (High does **not** load CS2’s world mesh; that export filled disk and froze the GPU)
+- Viewmodel default is **CS-like** (offset / FOV / scale). **VM** edits it live.
+
+Clips that have already finished loading stay in memory, so switching back does not re-export. Caches stay in AppData; Valve textures are never committed. Weapon skins are 64px nearest albedos, never native 4K. Leftover High/world dumps under `maps/*/high` are deleted automatically.
 
 On Doctor, **Cache Preview weapons** warms the gun/agent GLBs so the first clip is not a cold export. Missing maps fall back to a flat ground plane.
 

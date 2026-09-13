@@ -261,8 +261,14 @@ def doctor(as_json: bool) -> None:
     work_base = app_data_dir()
     try:
         work_base.mkdir(parents=True, exist_ok=True)
+        from reel_core.demo.map_assets import prune_preview_junk
+
+        junk = prune_preview_junk()
         free_gb = shutil.disk_usage(work_base).free / (1 << 30)
-        add("Disk space", free_gb > 5, f"{free_gb:.1f} GB free at {work_base}")
+        disk_detail = f"{free_gb:.1f} GB free at {work_base}"
+        if junk.get("freedBytes"):
+            disk_detail += f" (cleared {junk['freedBytes'] / (1 << 20):.0f} MB of unused High map dumps)"
+        add("Disk space", free_gb > 5, disk_detail)
     except OSError as exc:
         add("Disk space", False, f"cannot create {work_base}: {exc}")
 
@@ -543,24 +549,19 @@ def preview(
 
 @main.command(name="preview-map")
 @click.argument("map_name")
+@click.option("--quality", type=click.Choice(["low", "medium", "high"]), default="low")
 @click.option("--json", "as_json", is_flag=True)
-def preview_map(map_name: str, as_json: bool) -> None:
+def preview_map(map_name: str, quality: str, as_json: bool) -> None:
     """Export a local CS2 map mesh for Preview (Source2Viewer CLI, cached)."""
-    from reel_core.demo.map_assets import export_map_gltf, map_is_installed, resolve_map_stem
+    from reel_core.demo.map_assets import export_map_preview, map_is_installed, resolve_map_stem
 
     stem = resolve_map_stem(map_name)
-    path, source = export_map_gltf(stem)
-    payload = {
-        "ok": True,
-        "map": stem,
-        "mapInstalled": map_is_installed(stem),
-        "mapGltf": str(path) if path else None,
-        "mapSource": source,
-    }
+    payload = export_map_preview(stem, quality=quality)
+    payload["mapInstalled"] = map_is_installed(stem)
     if as_json:
         click.echo(json.dumps(payload))
         return
-    info(f"Map {map_name}  source={source}  {path}")
+    info(f"Map {map_name}  quality={quality}  source={payload.get('mapSource')}  {payload.get('mapGltf')}")
 
 
 @main.command(name="preview-assets")

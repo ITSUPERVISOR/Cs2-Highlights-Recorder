@@ -100,6 +100,10 @@ function parseGltf(data: ArrayBuffer | string): Promise<LoadedGltf | null> {
 const cache = new Map<string, LoadedGltf>();
 const inflight = new Map<string, Promise<LoadedGltf | null>>();
 
+function cacheKey(filePath: string) {
+  return filePath.replace(/\\/g, "/").toLowerCase();
+}
+
 export function isCachedAsset(obj: { userData?: Record<string, unknown> } | null | undefined) {
   return Boolean(obj?.userData?.cached);
 }
@@ -107,44 +111,54 @@ export function isCachedAsset(obj: { userData?: Record<string, unknown> } | null
 /** Drop a parsed file so the next load reads disk (wave-2 agent re-export). */
 export function invalidateGltfCache(filePath: string | null | undefined) {
   if (!filePath) return;
+  const key = cacheKey(filePath);
+  cache.delete(key);
+  inflight.delete(key);
   cache.delete(filePath);
   inflight.delete(filePath);
 }
 
 export function loadGltfCached(filePath: string | null | undefined): Promise<LoadedGltf | null> {
   if (!filePath) return Promise.resolve(null);
-  const hit = cache.get(filePath);
+  const key = cacheKey(filePath);
+  const hit = cache.get(key);
   if (hit) return Promise.resolve(hit);
-  const pending = inflight.get(filePath);
+  const pending = inflight.get(key);
   if (pending) return pending;
 
   const job = loadUncached(filePath)
     .then((loaded) => {
       if (loaded) {
         loaded.scene.userData.cached = true;
-        cache.set(filePath, loaded);
+        cache.set(key, loaded);
       }
       return loaded;
     })
-    .finally(() => inflight.delete(filePath));
-  inflight.set(filePath, job);
+    .finally(() => inflight.delete(key));
+  inflight.set(key, job);
   return job;
+}
+
+function loadGlbFromUrl(url: string): Promise<LoadedGltf | null> {
+  const loader = new GLTFLoader();
+  return new Promise((resolve) => {
+    loader.load(
+      url,
+      (gltf: GLTF) => resolve({ scene: gltf.scene, animations: gltf.animations ?? [] }),
+      undefined,
+      () => resolve(null),
+    );
+  });
 }
 
 async function loadUncached(filePath: string): Promise<LoadedGltf | null> {
   if (filePath.toLowerCase().endsWith(".glb")) {
     // Streamed through the reelmap:// handler rather than read into a Buffer and
-    // shipped over IPC, which matters for the larger exports.
-    const url = `reelmap://asset/?path=${encodeURIComponent(filePath)}`;
-    const loader = new GLTFLoader();
-    return new Promise((resolve) => {
-      loader.load(
-        url,
-        (gltf: GLTF) => resolve({ scene: gltf.scene, animations: gltf.animations ?? [] }),
-        undefined,
-        () => resolve(null),
-      );
-    });
+    // shipped over IPC, which matters for the larger exports. Forward slashes
+    // survive Chromium's custom-scheme decoder; backslash %5C often 404s.
+    const url = `reelmap://asset/?path=${encodeURIComponent(filePath.replace(/\\/g, "/"))}`;
+    const viaProtocol = await loadGlbFromUrl(url);
+    if (viaProtocol) return viaProtocol;
   }
   if (!window.reel.readPreviewFile) return null;
   const raw = await window.reel.readPreviewFile(filePath);

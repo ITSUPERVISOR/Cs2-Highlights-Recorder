@@ -61,12 +61,22 @@ export type Round = {
   moments: Moment[];
 };
 
+export type PreviewQuality = "low" | "medium" | "high";
+export type PreviewVmPreset = "cs" | "low" | "custom";
+
 export type ReelSettings = {
   steamId: string;
   askPlayerEveryTime: boolean;
   folders: string[];
   outputDir: string;
   pythonPath: string;
+  previewQuality: PreviewQuality;
+  previewVmPreset: PreviewVmPreset;
+  previewVmX: number;
+  previewVmY: number;
+  previewVmZ: number;
+  previewVmFov: number;
+  previewVmScale: number;
 };
 
 export type ParsePayload = {

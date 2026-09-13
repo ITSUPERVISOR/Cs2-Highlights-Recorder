@@ -6,6 +6,8 @@ import {
   type PreviewNade,
   type PreviewVolume,
 } from "./clipPlayback";
+import { instantiate, loadAsset, bundleWeaponPath, type AssetBundle } from "./gameAssets";
+import { nadeWeaponFromKind, resolveWeapon } from "./weaponTable";
 
 /**
  * Grenades in flight, smoke clouds, molotov fires and detonation bursts.
@@ -40,16 +42,19 @@ const NADE_COLOR: Record<string, number> = {
   flash: 0xd8d4c4,
   smoke: 0x8a8e9a,
   molotov: 0xc45c26,
+  incendiary: 0xc45c26,
   he: 0x6b8f3a,
   decoy: 0x9aa0a8,
 };
 
 export type NadeFx = {
   group: THREE.Group;
-  nades: { mesh: THREE.Mesh; trail: THREE.Sprite[] }[];
+  nades: { host: THREE.Group; fallback: THREE.Mesh; real: THREE.Object3D | null; kind: string; trail: THREE.Sprite[] }[];
   smokes: { puffs: THREE.Sprite[]; core: THREE.Mesh }[];
   fires: { flames: THREE.Sprite[]; pool: THREE.Mesh }[];
   bursts: THREE.Sprite[];
+  prototypes: Map<string, THREE.Group>;
+  loading: Set<string>;
   shared: {
     sphere: THREE.SphereGeometry;
     core: THREE.SphereGeometry;
@@ -135,16 +140,19 @@ export function makeNadeFx(): NadeFx {
   for (let i = 0; i < MAX_NADES; i += 1) {
     const material = new THREE.MeshLambertMaterial({ color: 0x6b8f3a });
     materials.push(material);
-    const mesh = new THREE.Mesh(sphere, material);
-    mesh.visible = false;
-    group.add(mesh);
+    const fallback = new THREE.Mesh(sphere, material);
+    fallback.visible = false;
+    const host = new THREE.Group();
+    host.visible = false;
+    host.add(fallback);
+    group.add(host);
     const trail: THREE.Sprite[] = [];
     for (let t = 0; t < TRAIL; t += 1) {
       const puff = sprite(soft, 0xffffff, THREE.NormalBlending, materials);
       trail.push(puff);
       group.add(puff);
     }
-    nades.push({ mesh, trail });
+    nades.push({ host, fallback, real: null, kind: "", trail });
   }
 
   const smokes: NadeFx["smokes"] = [];
@@ -200,7 +208,52 @@ export function makeNadeFx(): NadeFx {
     group.add(burst);
   }
 
-  return { group, nades, smokes, fires, bursts, shared: { sphere, core, disc, soft, materials } };
+  return {
+    group,
+    nades,
+    smokes,
+    fires,
+    bursts,
+    prototypes: new Map(),
+    loading: new Set(),
+    shared: { sphere, core, disc, soft, materials },
+  };
+}
+
+export function bindNadeModels(fx: NadeFx, assets: AssetBundle | null, kinds: string[]) {
+  if (!assets) return;
+  for (const kind of kinds) {
+    if (!kind || fx.prototypes.has(kind) || fx.loading.has(kind)) continue;
+    const path = bundleWeaponPath(assets, resolveWeapon(nadeWeaponFromKind(kind)).model);
+    if (!path) continue;
+    fx.loading.add(kind);
+    void loadAsset(path).then((loaded) => {
+      fx.loading.delete(kind);
+      if (!loaded) return;
+      const inst = instantiate(loaded);
+      fx.prototypes.set(kind, inst.root);
+    });
+  }
+}
+
+function attachNadeMesh(
+  entry: NadeFx["nades"][number],
+  proto: THREE.Group,
+  kind: string,
+) {
+  if (entry.real) entry.host.remove(entry.real);
+  const copy = proto.clone(true);
+  copy.traverse((child) => {
+    if (child.userData) delete child.userData.cached;
+  });
+  copy.updateMatrixWorld(true);
+  const size = new THREE.Box3().setFromObject(copy).getSize(new THREE.Vector3()).length();
+  // World nades are a few inches. Viewmodel exports are much larger.
+  if (size > 16) copy.scale.multiplyScalar(10 / size);
+  entry.host.add(copy);
+  entry.real = copy;
+  entry.kind = kind;
+  entry.fallback.visible = false;
 }
 
 /** Interpolated position along a grenade's recorded flight, or null if not airborne. */
@@ -244,13 +297,24 @@ export function updateNadeFx(
     if (slot >= MAX_NADES) break;
     const at = nadeAt(nade, tick);
     if (!at) continue;
-    const { mesh, trail } = fx.nades[slot];
+    const { host, fallback, trail } = fx.nades[slot];
     const p = cs2ToThree(at.x, at.y, at.z);
-    mesh.position.set(p.x, p.y, p.z);
-    mesh.visible = true;
-    (mesh.material as THREE.MeshLambertMaterial).color.setHex(
-      NADE_COLOR[nade.kind] ?? 0x6b8f3a,
-    );
+    host.position.set(p.x, p.y, p.z);
+    host.rotation.set(tick * 0.08, tick * 0.11, tick * 0.05);
+    host.visible = true;
+    const proto = fx.prototypes.get(nade.kind);
+    const entry = fx.nades[slot];
+    if (proto && (!entry.real || entry.kind !== nade.kind)) {
+      attachNadeMesh(entry, proto, nade.kind);
+    }
+    if (!entry.real) {
+      fallback.visible = true;
+      (fallback.material as THREE.MeshLambertMaterial).color.setHex(
+        NADE_COLOR[nade.kind] ?? 0x6b8f3a,
+      );
+    } else {
+      fallback.visible = false;
+    }
     for (let t = 0; t < TRAIL; t += 1) {
       const back = nadeAt(nade, tick - (t + 1) * 2);
       const puff = trail[t];
@@ -269,7 +333,7 @@ export function updateNadeFx(
     slot += 1;
   }
   for (let i = slot; i < MAX_NADES; i += 1) {
-    hide(fx.nades[i].mesh);
+    hide(fx.nades[i].host);
     fx.nades[i].trail.forEach(hide);
   }
 

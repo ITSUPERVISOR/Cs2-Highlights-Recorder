@@ -128,7 +128,7 @@ export function loadPreviewTexture(filePath: string | null | undefined): Promise
   const pending = textureInflight.get(filePath);
   if (pending) return pending;
   const job = new Promise<THREE.Texture | null>((resolve) => {
-    const url = `reelmap://asset/?path=${encodeURIComponent(filePath)}`;
+    const url = `reelmap://asset/?path=${encodeURIComponent(filePath.replace(/\\/g, "/"))}`;
     const loader = new THREE.TextureLoader();
     loader.load(
       url,

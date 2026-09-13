@@ -17,7 +17,7 @@ STRIDE = 2
 
 # Bumped whenever the dump payload gains fields. Cached dumps from an older
 # schema would otherwise be re-served without them and nothing would appear.
-SCHEMA = 5
+SCHEMA = 6
 
 # The AK's reload animation runs 2.433s, so a reload that began shortly before
 # the window is still playing inside it. Equips and zooms are instantaneous but
@@ -320,6 +320,7 @@ def _shots_in_window(parser: DemoParser, start_tick: int, end_tick: int) -> list
 
     names = _index_by_shooter(_safe_event(parser, "weapon_fire"), "user_steamid")
     damage = _index_by_shooter(_safe_event(parser, "bullet_damage"), "attacker_steamid")
+    hurts = _index_by_shooter(_safe_event(parser, "player_hurt"), "attacker_steamid")
 
     shots: list[dict] = []
     for _, row in window.iterrows():
@@ -329,7 +330,13 @@ def _shots_in_window(parser: DemoParser, start_tick: int, end_tick: int) -> list
         tick = int(row["tick"])
         fired = _nearest_event(names, steamid, tick)
         hit = _nearest_event(damage, steamid, tick)
+        hurt = _nearest_event(hurts, steamid, tick)
         distance = _num(hit, "distance", default=-1.0) if hit is not None else -1.0
+        dealt = 0.0
+        if hit is not None:
+            dealt = _num(hit, "dmg_health", "damage_health", "damage", default=0.0)
+        if dealt <= 0 and hurt is not None:
+            dealt = _num(hurt, "dmg_health", "dmg_health_real", "damage", default=0.0)
         shots.append(
             {
                 "tick": tick,
@@ -344,7 +351,12 @@ def _shots_in_window(parser: DemoParser, start_tick: int, end_tick: int) -> list
                 "dist": round(distance, 1) if distance > 0 else None,
                 "victim": (canonicalize_steamid(_str(hit, "victim_steamid")) or None)
                 if hit is not None
-                else None,
+                else (
+                    canonicalize_steamid(_str(hurt, "user_steamid", "victim_steamid")) or None
+                    if hurt is not None
+                    else None
+                ),
+                "damage": int(round(dealt)) if dealt > 0 else None,
             }
         )
     return shots

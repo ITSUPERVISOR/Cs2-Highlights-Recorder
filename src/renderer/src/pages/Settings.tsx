@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
-import type { ReelSettings, SteamAccount } from "../lib/types";
+import type { PreviewQuality, ReelSettings, SteamAccount } from "../lib/types";
 import { SectionHeader } from "../components/ui";
+
+const QUALITY_OPTIONS: { id: PreviewQuality; label: string; hint: string }[] = [
+  { id: "low", label: "Low", hint: "Collision hull. Fastest first paint." },
+  { id: "medium", label: "Medium", hint: "Hull plus local radar tint and overlay." },
+  { id: "high", label: "High", hint: "Same radar hull as Medium. The CS2 world mesh is too large to load." },
+];
 
 export function SettingsPage() {
   const [settings, setSettings] = useState<ReelSettings | null>(null);
@@ -117,6 +123,30 @@ export function SettingsPage() {
           ))}
         </ul>
       </div>
+      <section className="max-w-xl">
+        <span className="text-xs uppercase tracking-widest text-muted">Preview</span>
+        <p className="mt-2 text-sm text-muted">
+          Map quality is remembered across launches. First run is Low. Open Preview to tweak the
+          viewmodel live — offsets, FOV, and scale apply while the clip is playing.
+        </p>
+        <div className="mt-3 grid gap-2">
+          {QUALITY_OPTIONS.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              onClick={() => save({ previewQuality: option.id })}
+              className={`rounded-2xl border px-4 py-3 text-left ${
+                settings.previewQuality === option.id || (!settings.previewQuality && option.id === "low")
+                  ? "border-amber bg-raised"
+                  : "border-line hover:border-amber/40"
+              }`}
+            >
+              <div className="font-medium">{option.label}</div>
+              <div className="mt-1 text-sm text-muted">{option.hint}</div>
+            </button>
+          ))}
+        </div>
+      </section>
       <label className="block max-w-xl">
         <span className="text-xs uppercase tracking-widest text-muted">Clip output folder</span>
         <div className="mt-2 flex gap-2">

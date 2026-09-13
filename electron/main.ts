@@ -10,6 +10,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "../..");
 const PREVIEW_IPC_MAX = 32 * 1024 * 1024;
 
+app.commandLine.appendSwitch("force_high_performance_gpu");
+
 protocol.registerSchemesAsPrivileged([
   {
     scheme: "reelmap",
@@ -17,12 +19,22 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
+type PreviewQuality = "low" | "medium" | "high";
+type PreviewVmPreset = "cs" | "low" | "custom";
+
 type Settings = {
   steamId: string;
   askPlayerEveryTime: boolean;
   folders: string[];
   outputDir: string;
   pythonPath: string;
+  previewQuality: PreviewQuality;
+  previewVmPreset: PreviewVmPreset;
+  previewVmX: number;
+  previewVmY: number;
+  previewVmZ: number;
+  previewVmFov: number;
+  previewVmScale: number;
 };
 
 const DEFAULT_SETTINGS: Settings = {
@@ -31,7 +43,28 @@ const DEFAULT_SETTINGS: Settings = {
   folders: [],
   outputDir: join(homedir(), "Videos", "CS2 Reel"),
   pythonPath: "",
+  previewQuality: "low",
+  previewVmPreset: "cs",
+  previewVmX: 2,
+  previewVmY: -100,
+  previewVmZ: 0.5,
+  previewVmFov: 54,
+  previewVmScale: 1.4,
 };
+
+function asQuality(value: string | undefined): PreviewQuality {
+  return value === "medium" || value === "high" ? value : "low";
+}
+
+function asVmPreset(value: string | undefined): PreviewVmPreset {
+  return value === "low" || value === "custom" ? value : "cs";
+}
+
+function asNumber(value: string | undefined, fallback: number): number {
+  if (value == null || value === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 let db: Database;
 let dbPath = "";
@@ -80,6 +113,13 @@ function getSettings(): Settings {
     folders: map.folders ? (JSON.parse(map.folders) as string[]) : [],
     outputDir: map.outputDir ?? DEFAULT_SETTINGS.outputDir,
     pythonPath: map.pythonPath ?? DEFAULT_SETTINGS.pythonPath,
+    previewQuality: asQuality(map.previewQuality),
+    previewVmPreset: asVmPreset(map.previewVmPreset),
+    previewVmX: asNumber(map.previewVmX, DEFAULT_SETTINGS.previewVmX),
+    previewVmY: asNumber(map.previewVmY, DEFAULT_SETTINGS.previewVmY),
+    previewVmZ: asNumber(map.previewVmZ, DEFAULT_SETTINGS.previewVmZ),
+    previewVmFov: asNumber(map.previewVmFov, DEFAULT_SETTINGS.previewVmFov),
+    previewVmScale: asNumber(map.previewVmScale, DEFAULT_SETTINGS.previewVmScale),
   };
 }
 
@@ -91,6 +131,13 @@ function setSettings(partial: Partial<Settings>) {
     ["folders", JSON.stringify(next.folders)],
     ["outputDir", next.outputDir],
     ["pythonPath", next.pythonPath],
+    ["previewQuality", next.previewQuality],
+    ["previewVmPreset", next.previewVmPreset],
+    ["previewVmX", String(next.previewVmX)],
+    ["previewVmY", String(next.previewVmY)],
+    ["previewVmZ", String(next.previewVmZ)],
+    ["previewVmFov", String(next.previewVmFov)],
+    ["previewVmScale", String(next.previewVmScale)],
   ];
   for (const [key, value] of entries) {
     db.run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", [key, value]);
@@ -157,6 +204,27 @@ function parseJsonOutput(stdout: string) {
 
 function reelHome() {
   return resolve(process.env.CS2_REEL_HOME || join(process.env.LOCALAPPDATA || homedir(), "cs2-reel"));
+}
+
+function reelmapFilePath(requestUrl: string) {
+  let filePath = "";
+  try {
+    const parsed = new URL(requestUrl);
+    filePath = parsed.searchParams.get("path") || "";
+    if (!filePath) {
+      filePath = decodeURIComponent((parsed.pathname || "").replace(/^\/+/, ""));
+    }
+  } catch {
+    const match = requestUrl.match(/path=([^&]+)/);
+    filePath = match ? decodeURIComponent(match[1]) : "";
+  }
+  if (!filePath) return "";
+  try {
+    filePath = decodeURIComponent(filePath);
+  } catch {
+    /* already decoded */
+  }
+  return resolve(filePath.replace(/\//g, sep));
 }
 
 function isUnderReelHome(filePath: string) {
@@ -314,9 +382,13 @@ process.on("unhandledRejection", (err) => {
 app.whenReady().then(async () => {
   protocol.handle("reelmap", (request) => {
     try {
-      const filePath = decodeURIComponent(new URL(request.url).searchParams.get("path") || "");
+      const filePath = reelmapFilePath(request.url);
       if (!filePath || !isUnderReelHome(filePath) || !existsSync(filePath)) {
-        return new Response("not found", { status: 404 });
+        return new Response("not found", { status: 404, headers: { "Cache-Control": "no-store" } });
+      }
+      const norm = filePath.replace(/\\/g, "/").toLowerCase();
+      if (/\/maps\/[^/]+\/high\//.test(norm)) {
+        return new Response("too large", { status: 404, headers: { "Cache-Control": "no-store" } });
       }
       return net.fetch(pathToFileURL(filePath).href);
     } catch {
@@ -506,8 +578,12 @@ app.whenReady().then(async () => {
       return JSON.parse(readFileSync(cachePath, "utf8"));
     },
   );
-  ipcMain.handle("core:previewMap", async (_e, mapName: string) => {
-    const result = await runCore(["preview-map", String(mapName || ""), "--json"], 600_000);
+  ipcMain.handle("core:previewMap", async (_e, mapName: string, quality?: string) => {
+    const q = asQuality(String(quality || getSettings().previewQuality || "low"));
+    const result = await runCore(
+      ["preview-map", String(mapName || ""), "--quality", q, "--json"],
+      600_000,
+    );
     if (result.code !== 0 && !result.stdout.includes("{")) {
       throw new Error(result.stderr || result.stdout || "map export failed");
     }

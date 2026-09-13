@@ -30,7 +30,7 @@ const api = {
     tickrate?: number,
   ) => ipcRenderer.invoke("core:previewClip", demoPath, startTick, endTick, steamid, mapName, tickrate),
   readPreviewFile: (path: string) => ipcRenderer.invoke("preview:readFile", path),
-  previewMap: (mapName: string) => ipcRenderer.invoke("core:previewMap", mapName),
+  previewMap: (mapName: string, quality?: string) => ipcRenderer.invoke("core:previewMap", mapName, quality),
   previewAssets: (spec: unknown) => ipcRenderer.invoke("core:previewAssets", spec),
   watch: (demoPath: string, tick: number, steamid?: string) =>
     ipcRenderer.invoke("core:watch", demoPath, tick, steamid),

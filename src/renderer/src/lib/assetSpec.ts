@@ -12,7 +12,7 @@
  */
 
 import type { PreviewDump } from "./clipPlayback";
-import { allWeaponModels, allWeapons, casingModel, resolveWeapon, type WeaponInfo, type WorldCategory } from "./weaponTable";
+import { allWeaponModels, allWeapons, casingModel, nadeWeaponFromKind, resolveWeapon, type WeaponInfo, type WorldCategory } from "./weaponTable";
 
 export const DIRECTIONS = ["n", "ne", "e", "se", "s", "sw", "w", "nw"] as const;
 export type Direction = (typeof DIRECTIONS)[number];
@@ -116,6 +116,9 @@ function collectWeaponNames(dump: PreviewDump): string[] {
     if (equip.item) names.add(equip.item);
   }
   if ((dump.bombs ?? []).length) names.add("c4");
+  for (const nade of dump.grenades ?? []) {
+    if (nade.kind) names.add(nadeWeaponFromKind(nade.kind));
+  }
   return [...names];
 }
 

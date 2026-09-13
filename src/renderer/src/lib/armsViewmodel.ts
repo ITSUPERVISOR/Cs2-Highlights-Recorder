@@ -38,6 +38,7 @@ import {
   type AssetBundle,
 } from "./gameAssets";
 import { attachViewmodelWeapon, disposeWeaponModel, makeWeaponModel, updateWeaponModel, type WeaponModel } from "./weaponModels";
+import { captureViewmodelRest } from "./viewmodel";
 import type { WeaponInfo } from "./weaponTable";
 
 /** First-person meshes inside the agent model. */
@@ -440,7 +441,9 @@ export function placeArmsViewmodel(vm: ArmsViewmodel, camera: THREE.PerspectiveC
   const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * ARMS_DEPTH;
   const halfW = halfH * Math.max(camera.aspect, 0.0001);
   const box = firstPersonBounds(vm);
-  if (!box.isEmpty()) {
+  // Nade idle is authored on the lens centre. Do not pull it left to fit the
+  // can in frame — CS parks grenades lower-right, partly off-screen.
+  if (!box.isEmpty() && vm.info.kind !== "nade") {
     const floor = -halfH * 0.95;
     if (at.y < floor) vm.root.position.y += floor - at.y;
     const right = halfW * 0.92;
@@ -455,10 +458,17 @@ export function placeArmsViewmodel(vm: ArmsViewmodel, camera: THREE.PerspectiveC
     vm.root.position.z -= 3;
     vm.root.updateMatrixWorld(true);
   }
+  if (vm.info.kind === "nade") {
+    vm.root.position.x += 11;
+    vm.root.position.y -= 12;
+    vm.root.position.z -= 6;
+    vm.root.updateMatrixWorld(true);
+  }
 
   vm.root.userData.restX = vm.root.position.x;
   vm.root.userData.restY = vm.root.position.y;
   vm.root.userData.restZ = vm.root.position.z;
+  captureViewmodelRest(vm.root);
   return true;
 }
 

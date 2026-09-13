@@ -402,6 +402,18 @@ export function weaponCanScope(raw: string): boolean {
   return info.kind === "sniper" || info.id === "aug" || info.id === "sg556";
 }
 
+/** Match `dump.grenades[].kind` to a weapon id, or a fallback HE. */
+export function nadeWeaponFromKind(kind: string): string {
+  const key = String(kind ?? "").toLowerCase();
+  if (key.includes("flash")) return "flashbang";
+  if (key.includes("smoke")) return "smokegrenade";
+  if (key.includes("incen")) return "incgrenade";
+  if (key.includes("molotov") || key.includes("inferno")) return "molotov";
+  if (key.includes("decoy")) return "decoy";
+  if (key.includes("he") || key.includes("frag")) return "hegrenade";
+  return "hegrenade";
+}
+
 /** Match `dump.grenades[].kind` for an equipped nade, or null. */
 export function nadeFlightKind(raw: string): string | null {
   const info = resolveWeapon(raw);

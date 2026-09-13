@@ -1,13 +1,23 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { ClipStage, type ArmsStatus, type MapStatus } from "../components/ClipStage";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ClipStage, ClipStageBoundary, type ArmsStatus, type MapStatus } from "../components/ClipStage";
+import { PreviewStageHud } from "../components/PreviewStageHud";
 import { KillFeed } from "../components/KillFeed";
 import { Badge, Metric, SectionHeader, Stat, formatMap } from "../components/ui";
-import type { MatchRow, QueueItem } from "../lib/types";
+import type { MatchRow, PreviewQuality, QueueItem, ReelSettings } from "../lib/types";
 import type { PreviewDump } from "../lib/clipPlayback";
 import { buildAssetSpec, buildPriorityAssetSpec } from "../lib/assetSpec";
 import { invalidateGltfCache } from "../lib/loadGltf";
 import { mergeAssetBundles, type AssetBundle } from "../lib/gameAssets";
+import { getCachedDump, putCachedDump, getWarmClip, putWarmClip, getSharedAssets, putSharedAssets } from "../lib/clipCache";
+import { stripUnsafeMap } from "../lib/loadMapGltf";
 import { adrTone, ratingTone, toneClass } from "../lib/statColors";
+import {
+  DEFAULT_VIEWMODEL,
+  applyVmNamedPreset,
+  isPreviewQuality,
+  isPreviewVmPreset,
+  type ViewmodelPrefs,
+} from "../lib/previewPrefs";
 
 type Phase = "idle" | "poses" | "ready";
 
@@ -18,19 +28,50 @@ const PHASE_LABEL: Record<Phase, string> = {
 };
 
 /** Describe the geometry on screen, not the exporter that ran. */
-function describeGeometry(mapSource: string, status: MapStatus | null, mapInstalled?: boolean) {
-  if (mapSource === "missing" || mapInstalled === false) return "flat ground (map not in CS2 install)";
-  if (mapSource !== "collision") return "flat ground (no collision hull)";
+function describeGeometry(
+  mapSource: string,
+  status: MapStatus | null,
+  mapInstalled?: boolean,
+  quality?: PreviewQuality,
+  mapError?: string | null,
+) {
+  if (mapError) return mapError;
+  if (mapSource === "missing" || mapInstalled === false) return `${quality ?? "low"} · flat ground (map not in CS2 install)`;
+  const sourceLabel =
+    mapSource === "radar"
+      ? "radar"
+      : mapSource === "collision"
+        ? "collision"
+        : "flat";
+  if (mapSource === "fallback") return `${quality ?? "low"} · ${sourceLabel} ground (no collision hull)`;
   switch (status) {
     case "ready":
-      return "collision mesh";
+      return `${quality ?? "low"} · ${sourceLabel}`;
     case "failed":
-      return "flat ground (mesh failed to load)";
+      return `${quality ?? "low"} · flat ground (mesh failed to load)`;
     case "mismatch":
-      return "flat ground (mesh did not line up)";
+      return `${quality ?? "low"} · flat ground (mesh did not line up)`;
     default:
-      return "loading collision mesh…";
+      return `${quality ?? "low"} · loading ${sourceLabel}…`;
   }
+}
+
+function safeDump(dump: PreviewDump): PreviewDump {
+  return stripUnsafeMap(dump);
+}
+
+function prefsFromSettings(settings: ReelSettings | null): ViewmodelPrefs {
+  if (!settings) return DEFAULT_VIEWMODEL;
+  const preset = isPreviewVmPreset(settings.previewVmPreset) ? settings.previewVmPreset : "cs";
+  if (preset === "cs" || preset === "low") return applyVmNamedPreset(preset);
+  return {
+    preset,
+    x: settings.previewVmX,
+    y: settings.previewVmY,
+    z: settings.previewVmZ,
+    fov: settings.previewVmFov,
+    scale: settings.previewVmScale,
+  };
 }
 
 function describeHands(assets: AssetBundle | null, assetsReady: boolean, armsStatus: ArmsStatus | null) {
@@ -71,6 +112,44 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
   const [autoStarted, setAutoStarted] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [armsStatus, setArmsStatus] = useState<ArmsStatus | null>(null);
+  const [quality, setQuality] = useState<PreviewQuality>("low");
+  const [vmPrefs, setVmPrefs] = useState<ViewmodelPrefs>(DEFAULT_VIEWMODEL);
+  const [vmOpen, setVmOpen] = useState(false);
+  const [baseMapExporting, setBaseMapExporting] = useState(false);
+  const [mapRev, setMapRev] = useState(0);
+  const [clipLoading, setClipLoading] = useState(false);
+  const [stageClipId, setStageClipId] = useState<string | null>(null);
+  const vmRef = useRef(vmPrefs);
+  vmRef.current = vmPrefs;
+  const qualityRef = useRef(quality);
+  qualityRef.current = quality;
+  const loadedMap = useRef<{ clip: string; quality: PreviewQuality } | null>(null);
+
+  const persistVm = useCallback((next?: ViewmodelPrefs) => {
+    const value = next ?? vmRef.current;
+    vmRef.current = value;
+    setVmPrefs(value);
+    void window.reel.setSettings({
+      previewVmPreset: value.preset,
+      previewVmX: value.x,
+      previewVmY: value.y,
+      previewVmZ: value.z,
+      previewVmFov: value.fov,
+      previewVmScale: value.scale,
+    });
+  }, []);
+
+  const persistQuality = useCallback((next: PreviewQuality) => {
+    setQuality(next);
+    void window.reel.setSettings({ previewQuality: next });
+  }, []);
+
+  useEffect(() => {
+    window.reel.getSettings().then((settings: ReelSettings) => {
+      setQuality(isPreviewQuality(settings.previewQuality) ? settings.previewQuality : "low");
+      setVmPrefs(prefsFromSettings(settings));
+    }).catch(() => undefined);
+  }, []);
 
   const handleMapStatus = useCallback((status: MapStatus) => {
     setMapStatus(status);
@@ -100,29 +179,83 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
     if (!selected) {
       setMatch(null);
       setDump(null);
-      setAssets(null);
-      setAssetsReady(false);
-      setAssetsLoading(false);
       setPlaying(false);
       setPhase("idle");
       setMapChip(null);
       setMapExporting(false);
+      setBaseMapExporting(false);
       setArmsStatus(null);
+      setClipLoading(false);
+      setStageClipId(null);
       return;
     }
     let cancelled = false;
     setError(null);
-    setPhase("poses");
-    setDump(null);
-    setAssets(null);
-    setAssetsReady(false);
-    setAssetsLoading(false);
+
+    const warm = getWarmClip(selected.id);
+    if (warm?.ready) {
+      setDump(warm.dump);
+      setMatch(warm.match);
+      setTick(warm.dump.startTick);
+      setStageClipId(selected.id);
+      setPhase("ready");
+      setClipLoading(false);
+      setMapExporting(false);
+      setBaseMapExporting(false);
+      setMapChip(null);
+      setMapStatus(warm.mapStatus);
+      setArmsStatus(warm.armsStatus);
+      const shared = getSharedAssets();
+      if (shared) {
+        setAssets(shared);
+        setAssetsReady(true);
+      }
+      setPlaying(true);
+      setAutoStarted(true);
+      loadedMap.current = { clip: selected.id, quality: qualityRef.current };
+      return () => {
+        cancelled = true;
+      };
+    }
+
     setPlaying(false);
-    setMapStatus(null);
-    setMapChip(null);
-    setMapExporting(false);
     setAutoStarted(false);
-    setArmsStatus(null);
+    if (!getCachedDump(selected.id)) setArmsStatus(null);
+
+    const cachedDump = (() => {
+      const hit = getCachedDump(selected.id);
+      return hit ? safeDump(hit) : null;
+    })();
+    const shared = getSharedAssets();
+    if (shared) {
+      setAssets(shared);
+      setAssetsReady(true);
+    }
+    if (cachedDump) {
+      setDump(cachedDump);
+      setTick(cachedDump.startTick);
+      setStageClipId(selected.id);
+      setPhase("ready");
+      setClipLoading(false);
+      setMapChip(null);
+      if (cachedDump.mapGltf) {
+        setMapExporting(false);
+        setBaseMapExporting(false);
+      }
+    } else {
+      setPhase("poses");
+      setClipLoading(true);
+      setMapStatus(null);
+      setMapChip(null);
+      setMapExporting(false);
+      setBaseMapExporting(false);
+      if (!shared) {
+        setAssets(null);
+        setAssetsReady(false);
+      }
+    }
+    setAssetsLoading(false);
+
     (async () => {
       try {
         const row = await window.reel.getMatch(selected.matchId);
@@ -133,14 +266,29 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
         const start = Math.max(96, Math.floor(selected.moment.firstTick - 4 * tickrate));
         const end = Math.floor(selected.moment.lastTick + 3 * tickrate);
         const mapName = row.payload?.map ?? row.map ?? "";
+        const qualityNow = qualityRef.current;
+        loadedMap.current = { clip: selected.id, quality: qualityNow };
 
-        // Start the map export while the demo is still being parsed.
-        const mapTask = mapName
-          ? window.reel.previewMap(mapName).catch(() => null)
+        type MapResult = {
+          mapGltf?: string | null;
+          mapSource?: string;
+          radar?: PreviewDump["radar"];
+          error?: string | null;
+        } | null;
+
+        const lowTask = mapName
+          ? window.reel.previewMap(mapName, "low").catch(() => null)
           : Promise.resolve(null);
-        if (mapName) {
+        const upgradeTask =
+          mapName && qualityNow !== "low"
+            ? window.reel.previewMap(mapName, qualityNow).catch(() => null)
+            : Promise.resolve(null);
+        if (mapName && !cachedDump?.mapGltf) {
           setMapExporting(true);
+          setBaseMapExporting(true);
           setMapChip(`Exporting ${formatMap(mapName)}…`);
+        } else if (mapName && qualityNow !== "low" && cachedDump?.mapSource !== "radar") {
+          setMapExporting(true);
         }
 
         const payload = (await window.reel.previewClip(
@@ -152,34 +300,69 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
           tickrate,
         )) as PreviewDump;
         if (cancelled) return;
-        setDump(payload);
-        setTick(payload.startTick);
+        const mergedDump = safeDump({
+          ...payload,
+          mapGltf: payload.mapGltf || cachedDump?.mapGltf || null,
+          mapSource:
+            cachedDump &&
+            cachedDump.mapSource === "radar" &&
+            (payload.mapSource === "collision" || payload.mapSource === "fallback")
+              ? cachedDump.mapSource
+              : payload.mapSource,
+          radar: payload.radar ?? cachedDump?.radar ?? null,
+          mapError: payload.mapError ?? cachedDump?.mapError ?? null,
+        });
+        putCachedDump(selected.id, mergedDump);
+        setDump(mergedDump);
+        setTick(mergedDump.startTick);
+        setStageClipId(selected.id);
         setPlaying(false);
+        setClipLoading(false);
+        setPhase("ready");
 
-        const cachedCollision = Boolean(payload.mapGltf && payload.mapSource === "collision");
+        const cachedCollision = Boolean(
+          payload.mapGltf && (payload.mapSource === "collision" || payload.mapSource === "radar"),
+        );
         if (cachedCollision) {
-          setMapExporting(false);
+          setBaseMapExporting(false);
           setMapChip("Loading map geometry…");
         } else if (!mapName) {
+          setBaseMapExporting(false);
           setMapExporting(false);
           setMapChip(null);
         }
 
-        const applyMap = (map: { mapGltf?: string | null; mapSource?: string } | null) => {
+        const applyMap = (map: MapResult, kind: "base" | "upgrade") => {
           if (cancelled) return;
-          setMapExporting(false);
+          if (kind === "base") setBaseMapExporting(false);
           if (!map) {
-            if (!cachedCollision) setMapChip(null);
+            if (kind === "base" && !cachedCollision) setMapChip(null);
             return;
           }
           const mapSource = String(map.mapSource || payload.mapSource);
           const mapGltf = (map.mapGltf as string | null) ?? payload.mapGltf;
-          setDump((cur) => (cur ? { ...cur, mapGltf, mapSource } : cur));
-          if (mapSource !== "collision") setMapChip(null);
+          const radar = (map.radar as PreviewDump["radar"]) ?? null;
+          const mapError = map.error ?? null;
+          if (mapSource === "world64") return;
+          setDump((cur) => {
+            if (!cur) return cur;
+            if (kind === "base" && cur.mapSource === "radar") return cur;
+            const next = safeDump({ ...cur, mapGltf, mapSource, radar, mapError });
+            putCachedDump(selected.id, next);
+            return next;
+          });
+          setMapRev((n) => n + 1);
+          setMapChip(mapError);
         };
 
-        // Cache-hot dumps already have the collision path; do not wait on IPC.
-        void mapTask.then(applyMap);
+        void lowTask.then((map) => {
+          applyMap(map as MapResult, "base");
+          if (qualityNow === "low") setMapExporting(false);
+        });
+        void upgradeTask.then((map) => {
+          applyMap(map as MapResult, "upgrade");
+          if (qualityNow !== "low") setMapExporting(false);
+        });
 
         setAssetsLoading(true);
         const priority = buildPriorityAssetSpec(payload);
@@ -200,14 +383,16 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
               }
             }
             const merged = mergeAssetBundles(prev, next);
-            if (wave === "full") {
-              return {
-                ...merged,
-                weaponsMissing: next.weaponsMissing ?? [],
-                unmatchedAnims: next.unmatchedAnims ?? {},
-              };
-            }
-            return merged;
+            const stored =
+              wave === "full"
+                ? {
+                    ...merged,
+                    weaponsMissing: next.weaponsMissing ?? [],
+                    unmatchedAnims: next.unmatchedAnims ?? {},
+                  }
+                : merged;
+            putSharedAssets(stored);
+            return stored;
           });
           if (wave === "full") setAssetsReady(true);
         };
@@ -238,6 +423,7 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
           setPhase("ready");
           setMapChip(null);
           setMapExporting(false);
+          setBaseMapExporting(false);
           setAssetsReady(true);
         }
       }
@@ -246,6 +432,52 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
       cancelled = true;
     };
   }, [selected?.id]);
+
+  useEffect(() => {
+    if (!selected || !dump) return;
+    if (loadedMap.current?.clip === selected.id && loadedMap.current.quality === quality) return;
+    loadedMap.current = { clip: selected.id, quality };
+    let cancelled = false;
+    const mapName = dump.map;
+    if (!mapName) return;
+    setMapExporting(true);
+    setMapChip(quality === "low" ? "Loading map geometry…" : `Exporting ${quality} map…`);
+    window.reel
+      .previewMap(mapName, quality)
+      .then((map: {
+        mapGltf?: string | null;
+        mapSource?: string;
+        radar?: PreviewDump["radar"];
+        error?: string | null;
+      } | null) => {
+        if (cancelled || !map) {
+          if (!cancelled) setMapExporting(false);
+          return;
+        }
+        setMapExporting(false);
+        setDump((cur) => {
+          if (!cur) return cur;
+          if (String(map.mapSource) === "world64") return cur;
+          const next = safeDump({
+            ...cur,
+            mapGltf: (map.mapGltf as string | null) ?? cur.mapGltf,
+            mapSource: String(map.mapSource || cur.mapSource),
+            radar: map.radar ?? null,
+            mapError: map.error ?? null,
+          });
+          if (selected) putCachedDump(selected.id, next);
+          return next;
+        });
+        setMapRev((n) => n + 1);
+        setMapChip(map.error ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setMapExporting(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [quality, selected?.id, dump?.map]);
 
   useEffect(() => {
     if (!dump) return;
@@ -259,17 +491,26 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [dump]);
 
+  const meshSource = dump?.mapSource === "collision" || dump?.mapSource === "radar";
   const mapReady = Boolean(
     dump &&
-      !mapExporting &&
-      (dump.mapSource !== "collision" ||
-        mapStatus === "ready" ||
-        mapStatus === "failed" ||
-        mapStatus === "mismatch"),
+      !baseMapExporting &&
+      (!meshSource || mapStatus === "ready" || mapStatus === "failed" || mapStatus === "mismatch"),
   );
   const hasArmAssets = Boolean(assets && Object.keys(assets.agents ?? {}).length);
   const modelsReady = assetsReady && (!hasArmAssets || armsStatus === "real" || armsStatus === "failed");
   const prepared = Boolean(dump) && mapReady && modelsReady;
+
+  useEffect(() => {
+    if (!selected || !dump || !prepared) return;
+    putWarmClip(selected.id, {
+      dump,
+      match,
+      mapStatus: mapStatus ?? "ready",
+      armsStatus: armsStatus ?? "procedural",
+      ready: true,
+    });
+  }, [selected?.id, prepared, dump, match, mapStatus, armsStatus]);
 
   useEffect(() => {
     if (!prepared || !dump || autoStarted) return;
@@ -373,23 +614,41 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
                   "relative h-[52vh] min-h-[280px] overflow-hidden rounded-xl border border-line xl:h-auto xl:min-h-0 xl:flex-1"
             }
           >
-            {dump ? (
-              <ClipStage
-                dump={dump}
-                tick={tick}
-                kills={selected?.moment.kills ?? []}
-                assets={assets}
-                assetsReady={assetsReady}
-                onMapStatus={handleMapStatus}
-                onArmsStatus={handleArmsStatus}
-              />
+            {selected ? (
+              <ClipStageBoundary>
+                <ClipStage
+                  dump={dump}
+                  clipId={stageClipId}
+                  tick={tick}
+                  kills={selected?.moment.kills ?? []}
+                  assets={assets}
+                  assetsReady={assetsReady}
+                  vmPrefs={vmPrefs}
+                  mapRev={mapRev}
+                  onMapStatus={handleMapStatus}
+                  onArmsStatus={handleArmsStatus}
+                />
+              </ClipStageBoundary>
             ) : null}
-            {!dump && (
+            {!selected && (
               <div className="flex h-full min-h-[280px] items-center justify-center px-6 text-center text-sm text-muted">
-                {PHASE_LABEL[phase] || error || "Select a queued clip."}
+                Select a queued clip.
               </div>
             )}
-            {dump && !prepared && (
+            {selected && !dump && (
+              <div className="absolute inset-0 z-20 flex h-full min-h-[280px] items-center justify-center bg-ink px-6 text-center text-sm text-muted">
+                {PHASE_LABEL[phase] || error || "Reading clip poses from the demo…"}
+              </div>
+            )}
+            {dump && clipLoading && (
+              <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-ink/55">
+                <div className="flex items-center gap-3 rounded-full border border-line bg-panel/95 px-4 py-2">
+                  <div className="h-4 w-4 animate-spin rounded-full border-2 border-line border-t-amber" />
+                  <p className="text-sm text-fg">Loading clip…</p>
+                </div>
+              </div>
+            )}
+            {dump && !prepared && !clipLoading && (
               <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-ink/85 px-6 text-center">
                 <div className="h-6 w-6 animate-spin rounded-full border-2 border-line border-t-amber" />
                 <p className="text-sm text-muted">
@@ -398,8 +657,23 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
                     : "Loading player models…"}
                 </p>
                 <p className="max-w-xs text-[11px] text-muted">
-                  Playback waits until the map and models are in, so the clip does not run while they are still arriving.
+                  Playback waits on the collision hull and arms. Medium and High upgrade in the background.
                 </p>
+              </div>
+            )}
+            {dump && mapExporting && !baseMapExporting && (
+              <div className="pointer-events-none absolute bottom-20 left-1/2 z-30 -translate-x-1/2">
+                <div className="flex items-center gap-3 rounded-full border border-amber/60 bg-ink/90 px-4 py-2 shadow-lg shadow-black/40">
+                  <div className="h-4 w-4 animate-spin rounded-full border-2 border-amber/30 border-t-amber" />
+                  <div>
+                    <p className="text-sm font-semibold text-amber">Upgrading to {quality}</p>
+                    <p className="text-[11px] text-muted">
+                      {quality === "high"
+                        ? "High uses the radar hull — the CS2 world mesh is too large to load."
+                        : "You can keep watching on the current mesh."}
+                    </p>
+                  </div>
+                </div>
               </div>
             )}
             {dump && overlayKills.length > 0 && (
@@ -408,14 +682,19 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
               </div>
             )}
             {dump && (
-              <button
-                type="button"
-                onClick={() => setExpanded((v) => !v)}
-                title={expanded ? "Collapse (Esc)" : "Expand (F)"}
-                className="absolute right-3 top-3 z-30 rounded-lg border border-line bg-ink/70 px-2.5 py-1 text-xs text-muted hover:text-fg"
-              >
-                {expanded ? "⤡ Collapse" : "⤢ Expand"}
-              </button>
+              <div className="pointer-events-none absolute right-3 top-3 z-30">
+                <PreviewStageHud
+                  quality={quality}
+                  vm={vmPrefs}
+                  vmOpen={vmOpen}
+                  expanded={expanded}
+                  onQuality={persistQuality}
+                  onVm={setVmPrefs}
+                  onVmCommit={persistVm}
+                  onToggleVm={() => setVmOpen((open) => !open)}
+                  onToggleExpand={() => setExpanded((v) => !v)}
+                />
+              </div>
             )}
           </div>
           {dump && (
@@ -458,7 +737,7 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
           {dump && (
             <p className="text-[11px] text-muted">
               {formatMap(dump.map)} · {dump.frames.length} poses ·{" "}
-              {describeGeometry(dump.mapSource, mapStatus, dump.mapInstalled)}
+              {describeGeometry(dump.mapSource, mapStatus, dump.mapInstalled, quality, dump.mapError)}
               {hands ? ` · ${hands}` : ""}
               {gaps ? ` · ${gaps}` : ""}
             </p>
