@@ -139,7 +139,7 @@ def _build_rounds(parser: DemoParser, match_start_tick: int) -> list[Round]:
     ends = ends.sort_values("tick")
     ct_score = 0
     t_score = 0
-    for _, row in ends.iterrows():
+    for row in ends.to_dict("records"):
         end_tick = int(row["tick"])
         if end_tick < match_start_tick:
             continue
@@ -186,7 +186,7 @@ def get_slots(parser: DemoParser, sample_tick: int) -> dict[str, int]:
     if df.empty or "user_id" not in df.columns:
         return {}
     slots: dict[str, int] = {}
-    for _, row in df.iterrows():
+    for row in df.to_dict("records"):
         steamid = canonicalize_steamid(row.get("steamid", ""))
         user_id = row.get("user_id")
         if steamid and pd.notna(user_id):
@@ -229,7 +229,7 @@ def parse_demo(path: Path) -> DemoData:
 
     kills: list[Kill] = []
     deaths: list[Death] = []
-    for _, row in deaths_df.iterrows():
+    for row in deaths_df.to_dict("records"):
         tick = int(row["tick"])
         if tick < match_start_tick:
             continue
@@ -269,7 +269,7 @@ def parse_demo(path: Path) -> DemoData:
     player_names: dict[str, str] = {}
     try:
         info = parser.parse_player_info()
-        for _, row in info.iterrows():
+        for row in info.to_dict("records"):
             steamid = canonicalize_steamid(row.get("steamid", ""))
             if steamid:
                 player_names[steamid] = str(row.get("name", "") or steamid)
@@ -317,7 +317,7 @@ def _build_rosters(parser: DemoParser, rounds: list[Round]) -> dict[int, dict[st
     rosters: dict[int, dict[str, str]] = {r.index: {} for r in rounds}
     if df.empty:
         return rosters
-    for _, row in df.iterrows():
+    for row in df.to_dict("records"):
         tick = int(row["tick"])
         round_index = sample_by_tick.get(tick)
         if round_index is None:
@@ -338,7 +338,9 @@ def _build_damage(parser: DemoParser, match_start_tick: int) -> dict[str, int]:
     totals: dict[str, int] = {}
     if hurts.empty:
         return totals
-    for _, row in hurts.iterrows():
+    if "tick" in hurts.columns:
+        hurts = hurts[hurts["tick"] >= match_start_tick]
+    for row in hurts.to_dict("records"):
         tick = int(_col(row, "tick", 0) or 0)
         if tick < match_start_tick:
             continue
