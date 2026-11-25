@@ -10,12 +10,16 @@ import * as THREE from "three";
 import { cs2ToThree, shotsInWindow, type PreviewShot } from "./clipPlayback";
 import { cs2Forward, cs2ViewEuler } from "./viewAngles";
 import { furnitureMaterial } from "./assetMaterials";
-import { instantiate, loadAsset, bundleWeaponPath, type AssetBundle } from "./gameAssets";
+import { instantiate, loadAsset, bundleWeaponPath, releaseInstance, type AssetBundle } from "./gameAssets";
 import { casingModel, resolveWeapon } from "./weaponTable";
 
 const SLOTS = 20;
 const LIFE = 1.15;
+export const CASING_WINDOW_SECONDS = LIFE;
 const GRAVITY = 800;
+const FORWARD = new THREE.Vector3();
+const RIGHT = new THREE.Vector3();
+const UP_AXIS = new THREE.Vector3(0, 1, 0);
 
 export type CasingPool = {
   group: THREE.Group;
@@ -89,6 +93,14 @@ function bindCasingMesh(
     slot.add(mesh);
     if (bundle && model && !realCasings.has(model)) void realCasing(bundle, weapon);
   }
+  const mats: THREE.MeshStandardMaterial[] = [];
+  slot.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const mat = mesh.material as THREE.MeshStandardMaterial;
+    if (mat) mats.push(mat);
+  });
+  slot.userData.mats = mats;
 }
 
 function hash(tick: number, index: number) {
@@ -113,22 +125,22 @@ export function updateCasings(
     if (fade <= 0) continue;
 
     const origin = cs2ToThree(shot.ox, shot.oy, shot.oz);
-    const forward = cs2Forward(shot.pitch, shot.yaw);
-    const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0));
-    if (right.lengthSq() < 1e-6) right.set(1, 0, 0);
-    else right.normalize();
+    cs2Forward(shot.pitch, shot.yaw, FORWARD);
+    RIGHT.crossVectors(FORWARD, UP_AXIS);
+    if (RIGHT.lengthSq() < 1e-6) RIGHT.set(1, 0, 0);
+    else RIGHT.normalize();
 
     const jitter = hash(shot.tick, slot);
     const side = 6 + jitter * 4;
     const up = 4 + hash(shot.tick, slot + 3) * 6;
     const back = 2 + hash(shot.tick, slot + 7) * 3;
-    const vx = right.x * (90 + jitter * 40) + forward.x * -20;
+    const vx = RIGHT.x * (90 + jitter * 40) + FORWARD.x * -20;
     const vy = 140 + hash(shot.tick, slot + 11) * 60;
-    const vz = right.z * (90 + jitter * 40) + forward.z * -20;
+    const vz = RIGHT.z * (90 + jitter * 40) + FORWARD.z * -20;
 
-    const x = origin.x + right.x * side - forward.x * back + vx * age;
+    const x = origin.x + RIGHT.x * side - FORWARD.x * back + vx * age;
     const y = origin.y - 8 + up + vy * age - 0.5 * GRAVITY * age * age;
-    const z = origin.z + right.z * side - forward.z * back + vz * age;
+    const z = origin.z + RIGHT.z * side - FORWARD.z * back + vz * age;
 
     const node = pool.slots[slot];
     bindCasingMesh(node, shot.weapon, bundle, pool.fallback);
@@ -136,21 +148,20 @@ export function updateCasings(
     node.position.set(x, Math.max(origin.y - 36, y), z);
     node.rotation.copy(cs2ViewEuler(shot.pitch + age * 420, shot.yaw + age * 540));
     node.scale.setScalar(1);
-    node.traverse((child) => {
-      const mesh = child as THREE.Mesh;
-      if (!mesh.isMesh) return;
-      const mat = mesh.material as THREE.MeshStandardMaterial;
-      if (!mat) return;
+    const mats = (node.userData.mats as THREE.MeshStandardMaterial[] | undefined) ?? [];
+    for (const mat of mats) {
       if (mat.transparent || fade < 0.25) {
         mat.transparent = true;
         mat.opacity = Math.min(1, fade * 4);
       }
-    });
+    }
     slot += 1;
   }
   for (let i = slot; i < SLOTS; i += 1) pool.slots[i].visible = false;
 }
 
 export function disposeCasingPool(pool: CasingPool) {
+  for (const root of realCasings.values()) releaseInstance(root);
+  realCasings.clear();
   pool.fallback.dispose();
 }

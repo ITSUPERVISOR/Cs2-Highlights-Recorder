@@ -35,6 +35,7 @@ import {
   instantiate,
   loadAsset,
   METRES_TO_INCHES,
+  releaseInstance,
   type AssetBundle,
 } from "./gameAssets";
 import { attachViewmodelWeapon, disposeWeaponModel, makeWeaponModel, updateWeaponModel, type WeaponModel } from "./weaponModels";
@@ -236,6 +237,7 @@ export async function makeArmsViewmodel(
   };
   if (!poses.idle) {
     disposeWeaponModel(weapon);
+    releaseInstance(root);
     return null;
   }
 
@@ -487,5 +489,7 @@ export function frameArmsInView(vm: ArmsViewmodel): boolean {
 export function disposeArmsViewmodel(vm: ArmsViewmodel | null) {
   if (!vm) return;
   vm.weapon?.mixer?.stopAllAction();
+  disposeWeaponModel(vm.weapon);
   vm.root.removeFromParent();
+  releaseInstance(vm.root);
 }

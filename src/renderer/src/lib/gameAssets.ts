@@ -17,7 +17,7 @@
 
 import * as THREE from "three";
 import { clone as cloneSkeleton } from "three/addons/utils/SkeletonUtils.js";
-import { loadGltfCached, type LoadedGltf } from "./loadGltf";
+import { loadGltfCached, releaseGltf, retainGltf, type LoadedGltf } from "./loadGltf";
 
 export const METRES_TO_INCHES = 39.3701;
 
@@ -103,6 +103,12 @@ export function instantiate(
 
   const root = new THREE.Group();
   root.name = "assetRoot";
+  const key = loaded.scene.userData.cacheKey as string | undefined;
+  if (key) {
+    retainGltf(key);
+    root.userData.assetKey = key;
+    root.userData.assetRetained = true;
+  }
   // scale 1 keeps the model in its native metres, which is what an attachment
   // bone on an already-scaled skeleton expects.
   root.scale.setScalar(opts.scale ?? METRES_TO_INCHES);
@@ -113,19 +119,69 @@ export function instantiate(
   return { root, model, animations: loaded.animations };
 }
 
+/** Drop the retain taken by `instantiate`. Safe to call twice. */
+export function releaseInstance(root: THREE.Object3D | null | undefined) {
+  if (!root) return;
+  const data = root.userData as { assetRetained?: boolean; assetKey?: string };
+  if (!data.assetRetained || !data.assetKey) return;
+  data.assetRetained = false;
+  releaseGltf(data.assetKey);
+}
+
 export async function loadAsset(filePath: string | null | undefined): Promise<LoadedGltf | null> {
   return loadGltfCached(filePath);
 }
 
 const textureCache = new Map<string, THREE.Texture>();
 const textureInflight = new Map<string, Promise<THREE.Texture | null>>();
+const texturePins = new Map<string, number>();
+const MAX_TEXTURES = 64;
+
+function textureKey(filePath: string) {
+  return filePath.replace(/\\/g, "/").toLowerCase();
+}
+
+function evictTextures() {
+  let extra = textureCache.size - MAX_TEXTURES;
+  for (const [key, texture] of textureCache) {
+    if (extra <= 0) break;
+    if ((texturePins.get(key) ?? 0) > 0) continue;
+    texture.dispose();
+    textureCache.delete(key);
+    extra -= 1;
+  }
+}
+
+export function retainTexture(filePath: string | null | undefined) {
+  if (!filePath) return;
+  const key = textureKey(filePath);
+  texturePins.set(key, (texturePins.get(key) ?? 0) + 1);
+  const hit = textureCache.get(key);
+  if (!hit) return;
+  textureCache.delete(key);
+  textureCache.set(key, hit);
+}
+
+export function releaseTexture(filePath: string | null | undefined) {
+  if (!filePath) return;
+  const key = textureKey(filePath);
+  const next = (texturePins.get(key) ?? 0) - 1;
+  if (next <= 0) texturePins.delete(key);
+  else texturePins.set(key, next);
+  evictTextures();
+}
 
 /** A PNG/JPEG under the AppData cache, loaded through the reelmap protocol. */
 export function loadPreviewTexture(filePath: string | null | undefined): Promise<THREE.Texture | null> {
   if (!filePath) return Promise.resolve(null);
-  const hit = textureCache.get(filePath);
-  if (hit) return Promise.resolve(hit);
-  const pending = textureInflight.get(filePath);
+  const key = textureKey(filePath);
+  const hit = textureCache.get(key);
+  if (hit) {
+    textureCache.delete(key);
+    textureCache.set(key, hit);
+    return Promise.resolve(hit);
+  }
+  const pending = textureInflight.get(key);
   if (pending) return pending;
   const job = new Promise<THREE.Texture | null>((resolve) => {
     const url = `reelmap://asset/?path=${encodeURIComponent(filePath.replace(/\\/g, "/"))}`;
@@ -139,14 +195,15 @@ export function loadPreviewTexture(filePath: string | null | undefined): Promise
         texture.magFilter = THREE.NearestFilter;
         texture.minFilter = THREE.NearestFilter;
         texture.generateMipmaps = false;
-        textureCache.set(filePath, texture);
+        textureCache.set(key, texture);
+        evictTextures();
         resolve(texture);
       },
       undefined,
       () => resolve(null),
     );
-  }).finally(() => textureInflight.delete(filePath));
-  textureInflight.set(filePath, job);
+  }).finally(() => textureInflight.delete(key));
+  textureInflight.set(key, job);
   return job;
 }
 

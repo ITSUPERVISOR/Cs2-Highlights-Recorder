@@ -26,6 +26,10 @@ const TRACER_COLOR = 0xffe6a8;
 const TRACER_CORE_COLOR = 0xfff6d8;
 
 const UP = new THREE.Vector3(0, 1, 0);
+const DIR = new THREE.Vector3();
+const EYE = new THREE.Vector3();
+
+export const TRACER_WINDOW_SECONDS = TRACER_LIFE;
 
 export type TracerPool = {
   group: THREE.Group;
@@ -138,21 +142,33 @@ export function makeTracerPool(): TracerPool {
   return { group, tracers, cores, flashes, impacts, light, shared: { geometry, texture } };
 }
 
+function slotPoint(mesh: THREE.Object3D, key: string) {
+  const data = mesh.userData as Record<string, THREE.Vector3 | undefined>;
+  let point = data[key];
+  if (!point) {
+    point = new THREE.Vector3();
+    data[key] = point;
+  }
+  return point;
+}
+
 /** Place a short streak part-way along the shot, travelling with age. */
 function aimTracer(mesh: THREE.Mesh, shot: PreviewShot, age: number, radius: number, start = 0) {
-  const dir = cs2Forward(shot.pitch, shot.yaw);
+  const from = slotPoint(mesh, "from");
+  const hitPoint = slotPoint(mesh, "hit");
+  cs2Forward(shot.pitch, shot.yaw, DIR);
   const origin = cs2ToThree(shot.ox, shot.oy, shot.oz);
-  const eye = new THREE.Vector3(origin.x, origin.y, origin.z);
-  const from = eye.clone().addScaledVector(dir, start);
+  EYE.set(origin.x, origin.y, origin.z);
+  from.copy(EYE).addScaledVector(DIR, start);
   const full = shot.dist && shot.dist > 0 ? shot.dist : MISS_LENGTH;
   const path = Math.max(10, full - start);
   const head = Math.min(path, (age / TRAVEL) * full);
   const tail = Math.max(0, head - STREAK_LENGTH);
   const length = Math.max(10, head - tail);
-  mesh.position.copy(from).addScaledVector(dir, tail + length / 2);
-  mesh.quaternion.setFromUnitVectors(UP, dir);
+  mesh.position.copy(from).addScaledVector(DIR, tail + length / 2);
+  mesh.quaternion.setFromUnitVectors(UP, DIR);
   mesh.scale.set(radius, length, radius);
-  const hit = shot.dist && shot.dist > 0 ? eye.clone().addScaledVector(dir, shot.dist) : null;
+  const hit = shot.dist && shot.dist > 0 ? hitPoint.copy(EYE).addScaledVector(DIR, shot.dist) : null;
   return { from, hit };
 }
 

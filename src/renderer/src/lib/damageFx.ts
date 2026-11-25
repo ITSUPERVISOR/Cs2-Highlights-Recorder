@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { cs2ToThree, poseAt, type PreviewDump, type PreviewFrame } from "./clipPlayback";
+import { cs2ToThree, poseAt, ticksInWindow, type PreviewDump, type PreviewFrame } from "./clipPlayback";
 
 const TTL = 0.85;
 const POOL = 24;
@@ -39,7 +39,9 @@ export function damagePopsForDump(dump: PreviewDump): DamagePop[] {
     if (!pose) continue;
     fromShots.push({ tick: shot.tick, amount, x: pose.x, y: pose.y, z: pose.z + 18 });
   }
-  return fromShots.length ? fromShots : healthDrops(dump.frames ?? []);
+  const pops = fromShots.length ? fromShots : healthDrops(dump.frames ?? []);
+  pops.sort((a, b) => a.tick - b.tick);
+  return pops;
 }
 
 function makeDigitTexture(text: string) {
@@ -86,7 +88,7 @@ export function makeDamageFx(): DamageFx {
 
 export function updateDamageFx(fx: DamageFx, pops: DamagePop[], tick: number, tickrate: number) {
   const ttlTicks = Math.max(1, TTL * tickrate);
-  const live = pops.filter((pop) => tick >= pop.tick && tick - pop.tick <= ttlTicks);
+  const live = ticksInWindow(pops, tick, ttlTicks);
   for (let i = 0; i < fx.sprites.length; i++) {
     const sprite = fx.sprites[i];
     const pop = live[i];

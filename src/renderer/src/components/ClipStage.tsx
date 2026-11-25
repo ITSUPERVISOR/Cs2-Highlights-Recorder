@@ -1,4 +1,4 @@
-import { useEffect, useRef, Component, type ErrorInfo, type ReactNode } from "react";
+import { memo, useEffect, useImperativeHandle, useRef, useState, Component, type ErrorInfo, type ReactNode, type Ref } from "react";
 import * as THREE from "three";
 import type { Kill } from "../lib/types";
 import { Crosshair } from "./Crosshair";
@@ -6,22 +6,25 @@ import { PovHud } from "./PovHud";
 import { ScopeOverlay } from "./ScopeOverlay";
 import {
   cs2ToThree,
-  deathAge,
-  flashAt,
-  lastEquip,
-  poseAt,
+  deathAgeIndexed,
+  flashAtIndexed,
+  indexDump,
+  lastEquipIndexed,
+  narrowShotWindow,
+  poseAtIndexed,
   punchAt,
-  reloadProgress,
-  shotsInWindow,
-  throwAge,
+  reloadProgressIndexed,
+  shotsInWindowIndexed,
   throwAgeFromGrenades,
-  zoomAge,
-  speedAt,
-  velocityAt,
+  throwAgeIndexed,
+  velocityAtIndexed,
+  zoomAgeIndexed,
+  type PlaybackIndex,
   type PreviewDump,
   type PreviewPose,
 } from "../lib/clipPlayback";
 import { isCachedMapMesh, loadMapGltf } from "../lib/loadMapGltf";
+import { releaseGltf, retainGltf } from "../lib/loadGltf";
 import {
   describeBox,
   fitMapMesh,
@@ -53,10 +56,10 @@ import {
   loadRadarTexture,
   makeRadarPlane,
 } from "../lib/radarMap";
-import { disposeTracerPool, makeGlowTexture, makeTracerPool, updateTracers, type TracerPool } from "../lib/tracers";
+import { disposeTracerPool, makeGlowTexture, makeTracerPool, updateTracers, TRACER_WINDOW_SECONDS, type TracerPool } from "../lib/tracers";
 import { disposeNadeFx, makeNadeFx, updateNadeFx, bindNadeModels, type NadeFx } from "../lib/nadeFx";
 import { disposeDamageFx, makeDamageFx, updateDamageFx, damagePopsForDump, type DamageFx, type DamagePop } from "../lib/damageFx";
-import { disposeCasingPool, makeCasingPool, updateCasings, type CasingPool } from "../lib/casings";
+import { CASING_WINDOW_SECONDS, disposeCasingPool, makeCasingPool, updateCasings, type CasingPool } from "../lib/casings";
 import { bindWorldC4Model, disposeWorldC4, makeWorldC4, updateWorldC4, type WorldC4 } from "../lib/worldC4";
 import {
   AGENT_BY_TEAM,
@@ -93,16 +96,46 @@ const SCOPE_FOV = 40;
 const BASE_FOV = 75;
 /** Seconds to ease between hip and scoped FOV after a weapon_zoom event. */
 const SCOPE_EASE = 0.12;
+const WORLD_SCALE = new THREE.Vector3();
+const KILL_LINES = 8;
 
 export type ArmsStatus = "real" | "procedural" | "failed";
 
 /** What the viewport is actually drawing for the map, as opposed to what was exported. */
 export type MapStatus = "loading" | "ready" | "failed" | "mismatch";
 
+export type ClipStageHandle = { seek: (tick: number) => void };
+
+type StageHud = {
+  alive: boolean;
+  scoped: boolean;
+  weapon: string;
+  health: number;
+  armor: number;
+  place: string;
+  team: string;
+  pose?: PreviewPose;
+};
+
+function hudKey(hud: StageHud) {
+  return `${hud.alive}|${hud.scoped}|${hud.weapon}|${hud.health}|${hud.armor}|${hud.place}|${hud.team}`;
+}
+
+function makeKillLine() {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(6), 3));
+  const line = new THREE.Line(
+    geometry,
+    new THREE.LineBasicMaterial({ color: 0xf07178, transparent: true, opacity: 0.85 }),
+  );
+  line.visible = false;
+  line.frustumCulled = false;
+  return line;
+}
+
 type Props = {
   dump: PreviewDump | null;
   clipId?: string | null;
-  tick: number;
   kills: Kill[];
   assets?: AssetBundle | null;
   /** False during the first asset wave so third-person models wait for locomotion. */
@@ -111,6 +144,7 @@ type Props = {
   mapRev?: number;
   onMapStatus?: (status: MapStatus) => void;
   onArmsStatus?: (status: ArmsStatus) => void;
+  ref?: Ref<ClipStageHandle>;
 };
 
 function attachMuzzleFlash(host: THREE.Object3D) {
@@ -145,7 +179,7 @@ function pulseMuzzleFlash(host: THREE.Object3D, amount: number, silenced: boolea
   // Attached guns live in metres under an inches-scaled skeleton. A raw
   // scale of 3 would be ~10 ft across and wash the whole lens.
   host.updateMatrixWorld(true);
-  const worldScale = Math.max(1e-4, host.getWorldScale(new THREE.Vector3()).x);
+  const worldScale = Math.max(1e-4, host.getWorldScale(WORLD_SCALE).x);
   const inches = (silenced ? 1.6 : 3.4) * (0.8 + 0.35 * (1 - strength));
   const size = inches / worldScale;
   flash.scale.set(size, size, 1);
@@ -266,10 +300,9 @@ function disposeObject(obj: THREE.Object3D) {
   });
 }
 
-export function ClipStage({
+export const ClipStage = memo(function ClipStage({
   dump,
   clipId = null,
-  tick,
   kills,
   assets = null,
   assetsReady = true,
@@ -277,6 +310,7 @@ export function ClipStage({
   mapRev = 0,
   onMapStatus,
   onArmsStatus,
+  ref,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const worldRef = useRef<{
@@ -284,7 +318,6 @@ export function ClipStage({
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
     players: Map<string, THREE.Group>;
-    traces: THREE.Line[];
     viewmodel: THREE.Group | null;
     vmScene: THREE.Scene;
     vmCamera: THREE.PerspectiveCamera;
@@ -308,7 +341,26 @@ export function ClipStage({
     vmPrefs: ViewmodelPrefs;
     clipActors: Map<string, ClipActors>;
     activeClip: string;
+    renderNow: () => void;
+    playback: PlaybackIndex | null;
+    playbackDump: PreviewDump | null;
+    killLines: THREE.Line[];
+    hudKey: string;
   } | null>(null);
+  const flashRef = useRef<HTMLDivElement>(null);
+  const [hud, setHud] = useState<StageHud | null>(null);
+  const dumpRef = useRef(dump);
+  dumpRef.current = dump;
+  const killsRef = useRef(kills);
+  killsRef.current = kills;
+  const assetsRef = useRef(assets);
+  assetsRef.current = assets;
+  const assetsReadyRef = useRef(assetsReady);
+  assetsReadyRef.current = assetsReady;
+  const onArmsStatusRef = useRef(onArmsStatus);
+  onArmsStatusRef.current = onArmsStatus;
+  const seekRef = useRef<(tick: number) => void>(() => {});
+  const pendingTick = useRef<number | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -369,12 +421,17 @@ export function ClipStage({
     const c4 = makeWorldC4();
     scene.add(c4.group);
 
+    const killLines = Array.from({ length: KILL_LINES }, () => {
+      const line = makeKillLine();
+      scene.add(line);
+      return line;
+    });
+
     const world = {
       renderer,
       scene,
       camera,
       players: new Map<string, THREE.Group>(),
-      traces: [] as THREE.Line[],
       viewmodel: null as THREE.Group | null,
       vmScene,
       vmCamera,
@@ -398,8 +455,26 @@ export function ClipStage({
       vmPrefs,
       clipActors: new Map<string, ClipActors>(),
       activeClip: "",
+      renderNow: () => {},
+      playback: null as PlaybackIndex | null,
+      playbackDump: null as PreviewDump | null,
+      killLines,
+      hudKey: "",
     };
     worldRef.current = world;
+
+    const renderNow = () => {
+      renderer.render(scene, camera);
+      const vmVisible = Boolean(world.arms?.root.visible || world.viewmodel?.visible);
+      if (vmVisible) {
+        // Second pass over a cleared depth buffer keeps the gun in front of walls.
+        renderer.autoClear = false;
+        renderer.clearDepth();
+        renderer.render(vmScene, vmCamera);
+        renderer.autoClear = true;
+      }
+    };
+    world.renderNow = renderNow;
 
     const onResize = () => {
       if (!host.clientWidth || !host.clientHeight) return;
@@ -417,32 +492,25 @@ export function ClipStage({
         seatViewmodel(world.arms.root, world.vmPrefs);
       }
       renderer.setSize(host.clientWidth, host.clientHeight);
+      renderNow();
     };
     const observer = new ResizeObserver(onResize);
     observer.observe(host);
-
-    let raf = 0;
-    const draw = () => {
-      renderer.render(scene, camera);
-      const vmVisible = Boolean(world.arms?.root.visible || world.viewmodel?.visible);
-      if (vmVisible) {
-        // Second pass over a cleared depth buffer keeps the gun in front of walls.
-        renderer.autoClear = false;
-        renderer.clearDepth();
-        renderer.render(vmScene, vmCamera);
-        renderer.autoClear = true;
-      }
-      raf = requestAnimationFrame(draw);
-    };
-    draw();
+    renderNow();
+    const queued = pendingTick.current;
+    pendingTick.current = null;
+    if (dumpRef.current) seekRef.current(queued ?? dumpRef.current.startTick);
 
     return () => {
-      cancelAnimationFrame(raf);
       observer.disconnect();
       if (world.viewmodel) disposeObject(world.viewmodel);
       disposeArmsViewmodel(world.arms);
       for (const player of world.realPlayers.values()) disposePlayerModel(player);
       for (const snap of world.clipActors.values()) disposeActors(snap);
+      for (const line of killLines) {
+        line.geometry.dispose();
+        (line.material as THREE.Material).dispose();
+      }
       disposeTracerPool(world.tracerPool);
       disposeNadeFx(world.nadeFx);
       disposeDamageFx(world.damageFx);
@@ -532,12 +600,14 @@ export function ClipStage({
     const grid = root.getObjectByName("fallbackGrid");
     const meshSources = dump.mapSource === "collision" || dump.mapSource === "radar";
     if (!dump.mapGltf || !meshSources) return;
+    const mapPath = dump.mapGltf;
+    retainGltf(mapPath);
 
     const mapKey = `${dump.mapGltf}|${dump.mapSource}|${dump.radar?.image ?? ""}`;
     const existing = root.getObjectByName("mapMesh");
     if (existing?.userData.mapKey === mapKey) {
       onMapStatus?.("ready");
-      return;
+      return () => releaseGltf(mapPath);
     }
 
     const hadMesh = Boolean(existing);
@@ -547,7 +617,7 @@ export function ClipStage({
     const source = dump.mapSource;
     const radar = dump.radar;
     const { minX, maxX, minY, maxY, minZ, maxZ } = bounds;
-    loadMapGltf(dump.mapGltf).then(async (loaded) => {
+    loadMapGltf(mapPath).then(async (loaded) => {
       if (cancelled || worldRef.current?.scene !== world.scene) {
         if (loaded && !isCachedMapMesh(loaded)) disposeObject(loaded);
         return;
@@ -614,11 +684,13 @@ export function ClipStage({
       if (mesh.parent !== root) root.add(mesh);
       if (ground) ground.visible = false;
       if (grid) grid.visible = false;
+      world.renderNow();
       onMapStatus?.("ready");
     });
 
     return () => {
       cancelled = true;
+      releaseGltf(mapPath);
     };
   }, [dump?.mapGltf, dump?.mapSource, dump?.radar?.image, mapRev, onMapStatus]);
 
@@ -711,9 +783,16 @@ export function ClipStage({
     }
   }, [clipId, onArmsStatus]);
 
-  useEffect(() => {
+  seekRef.current = (tick: number) => {
     const world = worldRef.current;
-    if (!world || !dump) return;
+    const dump = dumpRef.current;
+    const assets = assetsRef.current;
+    const assetsReady = assetsReadyRef.current;
+    const kills = killsRef.current;
+    if (!world || !dump) {
+      pendingTick.current = tick;
+      return;
+    }
     const { scene, camera, players } = world;
     const pov = dump.povSteamid;
     const seen = new Set<string>();
@@ -727,10 +806,22 @@ export function ClipStage({
     const frameDt = rawDt > 0 && rawDt < 0.5 ? rawDt : 0;
     world.lastTick = tick;
 
+    const playback =
+      world.playbackDump === dump && world.playback ? world.playback : indexDump(dump);
+    world.playback = playback;
+    world.playbackDump = dump;
+    const wide = shotsInWindowIndexed(
+      playback,
+      tick,
+      dump.tickrate,
+      Math.max(CASING_WINDOW_SECONDS, 0.3),
+    );
+    const recentShots = narrowShotWindow(wide, tick, dump.tickrate, 0.3);
+
     for (const steamid of ids) {
       if (steamid === pov) continue;
       seen.add(steamid);
-      const pose = poseAt(dump.frames, tick, steamid);
+      const pose = poseAtIndexed(playback, tick, steamid);
       if (!pose) continue;
       const real = world.realPlayers.get(steamid);
       if (!real && assets && assetsReady && !world.playerLoading.has(steamid)) {
@@ -751,19 +842,18 @@ export function ClipStage({
           }
           world.realPlayers.set(steamid, model);
           scene.add(model.root);
+          world.renderNow();
         });
       }
 
       if (real) {
-        const vel = velocityAt(dump.frames, tick, steamid, dump.tickrate);
+        const vel = velocityAtIndexed(playback, tick, steamid, dump.tickrate);
         const info = resolveWeapon(pose.weapon);
         void setPlayerWeapon(real, assets, pose.weapon, skinKey(pose.weapon, pose.skin, pose.paintKit));
-        const own = shotsInWindow(dump.shots ?? [], tick, dump.tickrate, 0.3).filter(
-          (shot) => shot.steamid === steamid,
-        );
+        const own = recentShots.filter((shot) => shot.steamid === steamid);
         const last = own[own.length - 1];
         const shotAge = last ? (tick - last.tick) / Math.max(dump.tickrate, 1) : null;
-        const died = deathAge(dump.frames, tick, steamid, dump.tickrate);
+        const died = deathAgeIndexed(playback, tick, steamid, dump.tickrate);
         updatePlayerModel(real, {
           tick,
           tickrate: dump.tickrate,
@@ -777,7 +867,7 @@ export function ClipStage({
           velX: vel.x,
           velY: vel.y,
           shotAge,
-          reload: reloadProgress(dump.reloads, tick, dump.tickrate, steamid, real.weapon?.reloadSeconds ?? 2.4),
+          reload: reloadProgressIndexed(playback, tick, dump.tickrate, steamid, real.weapon?.reloadSeconds ?? 2.4),
           info,
         });
         const p = cs2ToThree(pose.x, pose.y, pose.z);
@@ -794,23 +884,27 @@ export function ClipStage({
         scene.add(rig);
       }
       setRigWeapon(rig, pose.weapon);
-      const died = deathAge(dump.frames, tick, steamid, dump.tickrate);
+      const died = deathAgeIndexed(playback, tick, steamid, dump.tickrate);
       const fall = pose.alive ? 0 : Math.min(1, (died ?? 10) / 0.45);
-      rig.traverse((child) => {
-        const mesh = child as THREE.Mesh;
-        if (!mesh.isMesh) return;
-        const mat = mesh.material as THREE.MeshLambertMaterial;
-        if (!mat) return;
-        mat.opacity = pose.alive ? 1 : 1 - 0.6 * fall;
-        mat.transparent = !pose.alive;
-      });
+      const fadeKey = pose.alive ? "alive" : fall.toFixed(2);
+      if (rig.userData.fadeKey !== fadeKey) {
+        rig.userData.fadeKey = fadeKey;
+        rig.traverse((child) => {
+          const mesh = child as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          const mat = mesh.material as THREE.MeshLambertMaterial;
+          if (!mat) return;
+          mat.opacity = pose.alive ? 1 : 1 - 0.6 * fall;
+          mat.transparent = !pose.alive;
+        });
+      }
       const p = cs2ToThree(pose.x, pose.y, pose.z);
       rig.position.set(p.x, p.y, p.z);
       rig.rotation.copy(cs2BodyEuler(pose.yaw));
       setRigDucking(rig, pose.duck ?? (pose.ducking ? 1 : 0));
       setRigDead(rig, !pose.alive, died ?? 10);
       aimRig(rig, pose.alive ? pose.pitch : 0);
-      animateRig(rig, pose.alive ? speedAt(dump.frames, tick, steamid, dump.tickrate) : 0, frameDt);
+      animateRig(rig, pose.alive ? velocityAtIndexed(playback, tick, steamid, dump.tickrate).speed : 0, frameDt);
       rig.visible = true;
     }
     for (const [id, rig] of players) {
@@ -820,7 +914,7 @@ export function ClipStage({
       if (!seen.has(id)) model.root.visible = false;
     }
 
-    const self = poseAt(dump.frames, tick, pov);
+    const self = poseAtIndexed(playback, tick, pov);
     if (self) {
       const eye = cs2ToThree(self.x, self.y, self.z + eyeHeight(self));
       camera.position.set(eye.x, eye.y, eye.z);
@@ -828,7 +922,7 @@ export function ClipStage({
       const punch = punchAt(self, dump.tickrate);
       camera.rotation.copy(cs2ViewEuler(self.pitch + punch.pitch, self.yaw + punch.yaw));
 
-      const wantFov = scopedFov(self.scoped, zoomAge(dump.zooms, tick, dump.tickrate, pov));
+      const wantFov = scopedFov(self.scoped, zoomAgeIndexed(playback, tick, dump.tickrate, pov));
       if (Math.abs(camera.fov - wantFov) > 0.05) {
         camera.fov = wantFov;
         camera.updateProjectionMatrix();
@@ -871,27 +965,27 @@ export function ClipStage({
           world.armsId = armsToken;
           world.vmScene.add(vm.root);
           if (world.viewmodel) world.viewmodel.visible = false;
+          world.renderNow();
         });
       }
 
       // Kick and flash are read off the last POV shot's age, so they are a pure
       // function of the playhead and stay correct while scrubbing.
-      const own = shotsInWindow(dump.shots ?? [], tick, dump.tickrate, RECOIL_SECONDS).filter(
-        (shot) => shot.steamid === pov,
-      );
+      const recoilShots = narrowShotWindow(wide, tick, dump.tickrate, RECOIL_SECONDS);
+      const own = recoilShots.filter((shot) => shot.steamid === pov);
       const last = own[own.length - 1];
       const shotAge = last ? (tick - last.tick) / Math.max(dump.tickrate, 1) : Infinity;
       const nadeThrow =
-        throwAge(dump.throws, tick, dump.tickrate, pov) ??
+        throwAgeIndexed(playback, tick, dump.tickrate, pov) ??
         throwAgeFromGrenades(dump.grenades, tick, dump.tickrate, self.weapon);
-      const reload = reloadProgress(
-        dump.reloads,
+      const reload = reloadProgressIndexed(
+        playback,
         tick,
         dump.tickrate,
         pov,
         world.arms?.weapon?.reloadSeconds ?? 2.4,
       );
-      const equip = lastEquip(dump.equips, tick, pov);
+      const equip = lastEquipIndexed(playback, tick, pov);
       const drawAge =
         equip && resolveWeapon(equip.item ?? "").id === info.id
           ? (tick - equip.tick) / Math.max(dump.tickrate, 1)
@@ -905,7 +999,7 @@ export function ClipStage({
           throwAge: nadeThrow,
           reload,
           drawAge,
-          speed: speedAt(dump.frames, tick, pov, dump.tickrate),
+          speed: velocityAtIndexed(playback, tick, pov, dump.tickrate).speed,
           walking: self.walking,
           dt: frameDt,
           yaw: self.yaw,
@@ -926,7 +1020,7 @@ export function ClipStage({
         }
         world.viewmodel.visible = !hideVm;
         animateViewmodel(world.viewmodel, world.motion, {
-          speed: speedAt(dump.frames, tick, pov, dump.tickrate),
+          speed: velocityAtIndexed(playback, tick, pov, dump.tickrate).speed,
           yaw: self.yaw,
           pitch: self.pitch,
           dt: frameDt,
@@ -938,8 +1032,14 @@ export function ClipStage({
     }
 
     // Every player's gunfire, not just the POV's, so incoming fire is visible.
-    updateTracers(world.tracerPool, dump.shots ?? [], tick, dump.tickrate, pov);
-    updateCasings(world.casings, dump.shots ?? [], tick, dump.tickrate, assets);
+    updateTracers(
+      world.tracerPool,
+      narrowShotWindow(wide, tick, dump.tickrate, TRACER_WINDOW_SECONDS),
+      tick,
+      dump.tickrate,
+      pov,
+    );
+    updateCasings(world.casings, wide, tick, dump.tickrate, assets);
     if (
       assets &&
       assetsReady &&
@@ -949,7 +1049,10 @@ export function ClipStage({
     ) {
       world.c4Loading = true;
       void bindWorldC4Model(world.c4, assets).finally(() => {
-        if (worldRef.current === world) world.c4Loading = false;
+        if (worldRef.current === world) {
+          world.c4Loading = false;
+          world.renderNow();
+        }
       });
     }
     updateWorldC4(world.c4, dump.bombs, tick);
@@ -966,57 +1069,86 @@ export function ClipStage({
     );
     updateDamageFx(world.damageFx, world.damagePops, tick, dump.tickrate);
 
-    for (const line of world.traces) {
-      line.geometry.dispose();
-      (line.material as THREE.Material).dispose();
-      scene.remove(line);
-    }
-    world.traces = [];
+    let slot = 0;
     const fade = dump.tickrate * 0.45;
     for (const kill of kills) {
+      if (slot >= world.killLines.length) break;
       if (kill.tick > tick || tick - kill.tick > fade) continue;
-      const atk = poseAt(dump.frames, kill.tick, kill.attackerSteamid);
-      const vic = poseAt(dump.frames, kill.tick, kill.victimSteamid);
+      const atk = poseAtIndexed(playback, kill.tick, kill.attackerSteamid);
+      const vic = poseAtIndexed(playback, kill.tick, kill.victimSteamid);
       if (!atk || !vic) continue;
       const a = cs2ToThree(atk.x, atk.y, atk.z + eyeHeight(atk));
       const b = cs2ToThree(vic.x, vic.y, vic.z + eyeHeight(vic) * 0.8);
-      const geo = new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(a.x, a.y, a.z),
-        new THREE.Vector3(b.x, b.y, b.z),
-      ]);
-      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0xf07178, transparent: true, opacity: 0.85 }));
-      scene.add(line);
-      world.traces.push(line);
+      const line = world.killLines[slot];
+      const attr = line.geometry.getAttribute("position") as THREE.BufferAttribute;
+      attr.setXYZ(0, a.x, a.y, a.z);
+      attr.setXYZ(1, b.x, b.y, b.z);
+      attr.needsUpdate = true;
+      line.visible = true;
+      slot += 1;
     }
+    for (; slot < world.killLines.length; slot += 1) world.killLines[slot].visible = false;
     const nextStatus: ArmsStatus = world.arms ? "real" : world.armsFailed ? "failed" : "procedural";
     if (world.armsStatus !== nextStatus) {
       world.armsStatus = nextStatus;
-      onArmsStatus?.(nextStatus);
+      onArmsStatusRef.current?.(nextStatus);
     }
-  }, [dump, tick, kills, assets, assetsReady, onArmsStatus]);
+    const flashed = self?.alive ? flashAtIndexed(playback, tick, dump.tickrate, pov) : 0;
+    if (flashRef.current) flashRef.current.style.opacity = String(flashed > 0.01 ? flashed : 0);
+    const nextHud: StageHud | null = self
+      ? {
+          alive: self.alive,
+          scoped: self.alive && Boolean(self.scoped) && weaponCanScope(self.weapon),
+          weapon: self.weapon,
+          health: Math.max(0, Math.round(self.health)),
+          armor: Math.max(0, Math.round(self.armor)),
+          place: self.place ?? "",
+          team: self.team,
+        }
+      : null;
+    const key = nextHud ? hudKey(nextHud) : "";
+    if (world.hudKey !== key) {
+      world.hudKey = key;
+      setHud(nextHud && self ? { ...nextHud, pose: self } : null);
+    }
+    world.renderNow();
+  };
 
-  // The canvas is appended imperatively, so it lives in its own child node
-  // rather than alongside React-managed children.
-  const self = dump ? poseAt(dump.frames, tick, dump.povSteamid) : null;
-  const povAlive = self?.alive ?? false;
-  const scoped = povAlive && (self?.scoped ?? false) && weaponCanScope(self?.weapon ?? "");
-  const flash = dump && povAlive ? flashAt(dump.blinds ?? [], tick, dump.tickrate, dump.povSteamid) : 0;
+  useImperativeHandle(
+    ref,
+    () => ({
+      seek(tick: number) {
+        seekRef.current(tick);
+      },
+    }),
+    [],
+  );
+
+  useEffect(() => {
+    const current = dumpRef.current;
+    if (!current) return;
+    const world = worldRef.current;
+    const tick = world && Number.isFinite(world.lastTick) ? world.lastTick : current.startTick;
+    seekRef.current(tick);
+  }, [dump, assets, assetsReady, kills, clipId, vmPrefs, mapRev]);
+
+  const povAlive = hud?.alive ?? false;
+  const scoped = hud?.scoped ?? false;
 
   return (
     <div className="relative h-full min-h-[280px] w-full overflow-hidden rounded-xl bg-ink">
       <div ref={hostRef} className="absolute inset-0" />
       {scoped && <ScopeOverlay />}
       {povAlive && !scoped && <Crosshair />}
-      {self && povAlive && <PovHud pose={self} team={self.team} />}
-      {flash > 0.01 && (
-        <div
-          className="pointer-events-none absolute inset-0 z-30 bg-white"
-          style={{ opacity: flash }}
-        />
-      )}
+      {hud?.pose && povAlive && <PovHud pose={hud.pose} team={hud.team} />}
+      <div
+        ref={flashRef}
+        className="pointer-events-none absolute inset-0 z-30 bg-white"
+        style={{ opacity: 0 }}
+      />
     </div>
   );
-}
+});
 
 export class ClipStageBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   state = { failed: false };

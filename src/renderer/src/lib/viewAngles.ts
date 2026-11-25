@@ -13,7 +13,7 @@ import * as THREE from "three";
  */
 
 /** Where the player is looking, as a unit vector in three.js space. */
-export function cs2Forward(pitchDeg: number, yawDeg: number): THREE.Vector3 {
+export function cs2Forward(pitchDeg: number, yawDeg: number, target?: THREE.Vector3): THREE.Vector3 {
   const pitch = THREE.MathUtils.degToRad(pitchDeg);
   const yaw = THREE.MathUtils.degToRad(yawDeg);
   // Source AngleVectors: positive pitch drives forward.z negative (downward).
@@ -22,7 +22,7 @@ export function cs2Forward(pitchDeg: number, yawDeg: number): THREE.Vector3 {
   const y = cp * Math.sin(yaw);
   const z = -Math.sin(pitch);
   // cs2ToThree
-  return new THREE.Vector3(x, z, -y);
+  return (target ?? new THREE.Vector3()).set(x, z, -y);
 }
 
 /** Euler angles (YXZ) that aim a -Z facing object along the player's view. */
