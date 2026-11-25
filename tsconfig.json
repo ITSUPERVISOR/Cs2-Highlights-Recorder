@@ -15,5 +15,6 @@
       "@/*": ["src/renderer/src/*"]
     }
   },
-  "include": ["src/renderer/src", "electron"]
+  "include": ["src/renderer/src", "electron"],
+  "exclude": ["node_modules", "src/renderer/src/**/*.test.ts"]
 }

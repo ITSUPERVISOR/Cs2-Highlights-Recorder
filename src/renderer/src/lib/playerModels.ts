@@ -21,6 +21,7 @@ import {
   instantiate,
   loadAsset,
   METRES_TO_INCHES,
+  releaseInstance,
   type AssetBundle,
 } from "./gameAssets";
 import { hideMesh, PLACEHOLDER_MESH } from "./armsViewmodel";
@@ -304,4 +305,5 @@ export function disposePlayerModel(player: PlayerModel | null) {
   player.mixer.stopAllAction();
   disposeWeaponModel(player.weapon);
   player.root.removeFromParent();
+  releaseInstance(player.root);
 }

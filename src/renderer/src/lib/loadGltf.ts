@@ -90,39 +90,116 @@ function parseGltf(data: ArrayBuffer | string): Promise<LoadedGltf | null> {
 }
 
 /**
- * Parsed assets, kept for the life of the window.
+ * Parsed assets, kept until the cache is over its cap and nothing on screen
+ * still references them.
  *
- * A collision hull runs to hundreds of megabytes and several seconds of parse
- * time, and switching clips on one map would otherwise pay that every time.
- * Cached scenes carry `userData.cached` so `disposeObject` leaves their geometry
- * alone; freeing it would leave the cache holding dead GPU handles.
+ * A collision hull runs to hundreds of megabytes. Cached scenes carry
+ * `userData.cached` so callers do not `geometry.dispose()` them: clones from
+ * `SkeletonUtils.clone` share that geometry, and disposing it forces a re-upload.
+ * `retainGltf` / `releaseGltf` count live users. Eviction runs after the current
+ * turn so a StrictMode effect can release and retain the same file first.
  */
-const cache = new Map<string, LoadedGltf>();
+const cache = new Map<string, CacheEntry>();
 const inflight = new Map<string, Promise<LoadedGltf | null>>();
+const pins = new Map<string, number>();
+
+const MAX_MAPS = 2;
+const MAX_MODELS = 24;
+
+type CacheEntry = {
+  loaded: LoadedGltf;
+  kind: "map" | "model";
+};
 
 function cacheKey(filePath: string) {
   return filePath.replace(/\\/g, "/").toLowerCase();
+}
+
+function assetKind(filePath: string): "map" | "model" {
+  return /\/maps\//.test(filePath.replace(/\\/g, "/").toLowerCase()) ? "map" : "model";
 }
 
 export function isCachedAsset(obj: { userData?: Record<string, unknown> } | null | undefined) {
   return Boolean(obj?.userData?.cached);
 }
 
+function disposeLoaded(loaded: LoadedGltf) {
+  loaded.scene.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (mesh.geometry) mesh.geometry.dispose();
+    const material = mesh.material;
+    if (!material) return;
+    const list = Array.isArray(material) ? material : [material];
+    for (const mat of list) mat.dispose();
+  });
+}
+
+let evictQueued = false;
+
+function evictNow() {
+  for (const kind of ["map", "model"] as const) {
+    const max = kind === "map" ? MAX_MAPS : MAX_MODELS;
+    const keys = [...cache.keys()].filter((key) => cache.get(key)?.kind === kind);
+    let extra = keys.length - max;
+    for (const key of keys) {
+      if (extra <= 0) break;
+      if ((pins.get(key) ?? 0) > 0) continue;
+      const entry = cache.get(key);
+      cache.delete(key);
+      if (entry) disposeLoaded(entry.loaded);
+      extra -= 1;
+    }
+  }
+}
+
+function scheduleEvict() {
+  if (evictQueued) return;
+  evictQueued = true;
+  queueMicrotask(() => {
+    evictQueued = false;
+    evictNow();
+  });
+}
+
+function touch(key: string) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  cache.delete(key);
+  cache.set(key, entry);
+  return entry;
+}
+
+export function retainGltf(filePath: string | null | undefined) {
+  if (!filePath) return;
+  const key = cacheKey(filePath);
+  pins.set(key, (pins.get(key) ?? 0) + 1);
+  touch(key);
+}
+
+export function releaseGltf(filePath: string | null | undefined) {
+  if (!filePath) return;
+  const key = cacheKey(filePath);
+  const next = (pins.get(key) ?? 0) - 1;
+  if (next <= 0) pins.delete(key);
+  else pins.set(key, next);
+  scheduleEvict();
+}
+
 /** Drop a parsed file so the next load reads disk (wave-2 agent re-export). */
 export function invalidateGltfCache(filePath: string | null | undefined) {
   if (!filePath) return;
   const key = cacheKey(filePath);
+  const entry = cache.get(key);
   cache.delete(key);
   inflight.delete(key);
-  cache.delete(filePath);
-  inflight.delete(filePath);
+  if (entry && (pins.get(key) ?? 0) === 0) disposeLoaded(entry.loaded);
 }
 
 export function loadGltfCached(filePath: string | null | undefined): Promise<LoadedGltf | null> {
   if (!filePath) return Promise.resolve(null);
   const key = cacheKey(filePath);
-  const hit = cache.get(key);
-  if (hit) return Promise.resolve(hit);
+  const hit = touch(key);
+  if (hit) return Promise.resolve(hit.loaded);
   const pending = inflight.get(key);
   if (pending) return pending;
 
@@ -130,7 +207,9 @@ export function loadGltfCached(filePath: string | null | undefined): Promise<Loa
     .then((loaded) => {
       if (loaded) {
         loaded.scene.userData.cached = true;
-        cache.set(key, loaded);
+        loaded.scene.userData.cacheKey = key;
+        cache.set(key, { loaded, kind: assetKind(filePath) });
+        evictNow();
       }
       return loaded;
     })

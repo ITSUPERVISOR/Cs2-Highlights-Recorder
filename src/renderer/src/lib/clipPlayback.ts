@@ -423,6 +423,24 @@ export function bombAt(bombs: PreviewBomb[] | undefined, tick: number): PreviewB
 }
 
 /** How far through its life a volume is at `tick`, or null when it is not active. */
+export type { PlaybackIndex } from "./playbackIndex";
+export {
+  bombAtIndexed,
+  deathAgeIndexed,
+  flashAtIndexed,
+  frameIndexAtIndexed,
+  indexDump,
+  lastEquipIndexed,
+  narrowShotWindow,
+  poseAtIndexed,
+  reloadProgressIndexed,
+  shotsInWindowIndexed,
+  throwAgeIndexed,
+  ticksInWindow,
+  velocityAtIndexed,
+  zoomAgeIndexed,
+} from "./playbackIndex";
+
 export function volumePhase(
   volume: { tick: number; endTick: number | null },
   tick: number,

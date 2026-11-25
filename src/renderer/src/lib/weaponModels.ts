@@ -25,6 +25,9 @@ import {
   loadPreviewTexture,
   meshBounds,
   METRES_TO_INCHES,
+  releaseInstance,
+  releaseTexture,
+  retainTexture,
   type AssetBundle,
 } from "./gameAssets";
 import { casingModel, type WeaponInfo } from "./weaponTable";
@@ -58,6 +61,8 @@ export type WeaponModel = {
   /** Real duration of the reload clip, so the hands can match it. */
   reloadSeconds: number;
   shootSeconds: number;
+  /** Albedo retained in the texture cache, released with the model. */
+  skinPath: string | null;
 };
 
 /**
@@ -133,7 +138,9 @@ export async function makeWeaponModel(
     attached ? { flipForward: false, scale: 1 } : {},
   );
   root.name = `weapon:${info.id}`;
-  const map = opts.skinKey ? await loadPreviewTexture(bundleSkinPath(bundle, opts.skinKey)) : null;
+  const skinPath = opts.skinKey ? bundleSkinPath(bundle, opts.skinKey) : null;
+  const map = skinPath ? await loadPreviewTexture(skinPath) : null;
+  if (skinPath && map) retainTexture(skinPath);
   applyWeaponMaterials(model, info.kind, map);
 
   // Measured while `root` is still unparented, so these are in root's own space.
@@ -166,6 +173,7 @@ export async function makeWeaponModel(
     reload: mixer ? makeAction(mixer, reloadClip) : null,
     reloadSeconds: reloadClip?.duration ?? 0,
     shootSeconds: shootClip?.duration ?? 0,
+    skinPath: skinPath && map ? skinPath : null,
   };
 }
 
@@ -362,8 +370,10 @@ export function disposeWeaponModel(model: WeaponModel | null) {
   if (!model) return;
   model.mixer?.stopAllAction();
   model.root.removeFromParent();
-  // Geometry and materials are shared with the cached asset and other instances,
-  // so nothing here is disposed. Only the clone's scene graph is dropped.
+  releaseTexture(model.skinPath);
+  model.skinPath = null;
+  // Geometry is shared with the cached asset. Release the pin instead of disposing it.
+  releaseInstance(model.root);
 }
 
 /** Casing model path for this weapon, for the shell ejection pool. */

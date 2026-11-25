@@ -6,7 +6,7 @@ import {
   type PreviewNade,
   type PreviewVolume,
 } from "./clipPlayback";
-import { instantiate, loadAsset, bundleWeaponPath, type AssetBundle } from "./gameAssets";
+import { instantiate, loadAsset, bundleWeaponPath, releaseInstance, type AssetBundle } from "./gameAssets";
 import { nadeWeaponFromKind, resolveWeapon } from "./weaponTable";
 
 /**
@@ -256,13 +256,34 @@ function attachNadeMesh(
   entry.fallback.visible = false;
 }
 
+const nadeCursor = new WeakMap<PreviewNade, number>();
+
+/** Last sample at or before `tick`, resuming from a nearby hint. */
+function pointIndex(points: { tick: number }[], tick: number, hint: number) {
+  const count = points.length;
+  if (hint < 0 || hint >= count) hint = 0;
+  if (points[hint].tick <= tick && (hint + 1 >= count || points[hint + 1].tick > tick)) return hint;
+  if (hint + 1 < count && points[hint + 1].tick <= tick && (hint + 2 >= count || points[hint + 2].tick > tick)) {
+    return hint + 1;
+  }
+  let lo = 0;
+  let hi = count - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (points[mid].tick <= tick) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
 /** Interpolated position along a grenade's recorded flight, or null if not airborne. */
-function nadeAt(nade: PreviewNade, tick: number) {
+function nadeAt(nade: PreviewNade, tick: number, remember: boolean) {
   const points = nade.points;
   if (!points?.length) return null;
   if (tick < points[0].tick || tick > points[points.length - 1].tick) return null;
-  let i = 0;
-  while (i < points.length - 2 && points[i + 1].tick <= tick) i += 1;
+  const i = pointIndex(points, tick, nadeCursor.get(nade) ?? 0);
+  // The playhead cursor stays on the live sample. Trail lookups must not drag it backward.
+  if (remember) nadeCursor.set(nade, i);
   const a = points[i];
   const b = points[i + 1] ?? a;
   const span = b.tick - a.tick;
@@ -295,7 +316,7 @@ export function updateNadeFx(
   let slot = 0;
   for (const nade of data.grenades ?? []) {
     if (slot >= MAX_NADES) break;
-    const at = nadeAt(nade, tick);
+    const at = nadeAt(nade, tick, true);
     if (!at) continue;
     const { host, fallback, trail } = fx.nades[slot];
     const p = cs2ToThree(at.x, at.y, at.z);
@@ -316,7 +337,7 @@ export function updateNadeFx(
       fallback.visible = false;
     }
     for (let t = 0; t < TRAIL; t += 1) {
-      const back = nadeAt(nade, tick - (t + 1) * 2);
+      const back = nadeAt(nade, tick - (t + 1) * 2, false);
       const puff = trail[t];
       if (!back) {
         hide(puff);
@@ -431,6 +452,8 @@ export function updateNadeFx(
 }
 
 export function disposeNadeFx(fx: NadeFx) {
+  for (const proto of fx.prototypes.values()) releaseInstance(proto);
+  fx.prototypes.clear();
   for (const material of fx.shared.materials) material.dispose();
   fx.shared.sphere.dispose();
   fx.shared.core.dispose();

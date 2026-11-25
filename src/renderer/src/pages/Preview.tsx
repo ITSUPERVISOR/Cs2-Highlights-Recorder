@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ClipStage, ClipStageBoundary, type ArmsStatus, type MapStatus } from "../components/ClipStage";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ClipStage, ClipStageBoundary, type ArmsStatus, type ClipStageHandle, type MapStatus } from "../components/ClipStage";
 import { PreviewStageHud } from "../components/PreviewStageHud";
 import { KillFeed } from "../components/KillFeed";
 import { Badge, Metric, SectionHeader, Stat, formatMap } from "../components/ui";
-import type { MatchRow, PreviewQuality, QueueItem, ReelSettings } from "../lib/types";
+import type { Kill, MatchRow, PreviewQuality, QueueItem, ReelSettings } from "../lib/types";
 import type { PreviewDump } from "../lib/clipPlayback";
 import { buildAssetSpec, buildPriorityAssetSpec } from "../lib/assetSpec";
 import { invalidateGltfCache } from "../lib/loadGltf";
@@ -26,6 +26,16 @@ const PHASE_LABEL: Record<Phase, string> = {
   poses: "Reading clip poses from the demo…",
   ready: "",
 };
+
+const EMPTY_KILLS: Kill[] = [];
+
+function sameKills(left: Kill[], right: Kill[]) {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
 
 /** Describe the geometry on screen, not the exporter that ran. */
 function describeGeometry(
@@ -102,7 +112,6 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
   const [assets, setAssets] = useState<AssetBundle | null>(null);
   const [assetsReady, setAssetsReady] = useState(false);
   const [assetsLoading, setAssetsLoading] = useState(false);
-  const [tick, setTick] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -119,11 +128,33 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
   const [mapRev, setMapRev] = useState(0);
   const [clipLoading, setClipLoading] = useState(false);
   const [stageClipId, setStageClipId] = useState<string | null>(null);
+  const [overlayKills, setOverlayKills] = useState<Kill[]>([]);
+  const stageRef = useRef<ClipStageHandle>(null);
+  const tickRef = useRef(0);
+  const scrubRef = useRef<HTMLInputElement>(null);
+  const timeRef = useRef<HTMLSpanElement>(null);
+  const killsRef = useRef<Kill[]>(EMPTY_KILLS);
   const vmRef = useRef(vmPrefs);
   vmRef.current = vmPrefs;
   const qualityRef = useRef(quality);
   qualityRef.current = quality;
   const loadedMap = useRef<{ clip: string; quality: PreviewQuality } | null>(null);
+  const dumpRef = useRef(dump);
+  dumpRef.current = dump;
+  const playingRef = useRef(playing);
+  playingRef.current = playing;
+
+  const paintPlayhead = useCallback((next: number, current: PreviewDump, writeSlider: boolean) => {
+    tickRef.current = next;
+    if (writeSlider && scrubRef.current) scrubRef.current.value = String(Math.round(next));
+    if (timeRef.current) {
+      timeRef.current.textContent = `${((next - current.startTick) / Math.max(current.tickrate, 1)).toFixed(1)}s`;
+    }
+    stageRef.current?.seek(next);
+    const windowTicks = current.tickrate * 5;
+    const visible = killsRef.current.filter((kill) => kill.tick <= next && next - kill.tick <= windowTicks);
+    setOverlayKills((cur) => (sameKills(cur, visible) ? cur : visible));
+  }, []);
 
   const persistVm = useCallback((next?: ViewmodelPrefs) => {
     const value = next ?? vmRef.current;
@@ -174,6 +205,7 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
   }, []);
 
   const selected = items.find((item) => item.id === selectedId) ?? null;
+  killsRef.current = selected?.moment.kills ?? EMPTY_KILLS;
 
   useEffect(() => {
     if (!selected) {
@@ -196,7 +228,7 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
     if (warm?.ready) {
       setDump(warm.dump);
       setMatch(warm.match);
-      setTick(warm.dump.startTick);
+      paintPlayhead(warm.dump.startTick, warm.dump, true);
       setStageClipId(selected.id);
       setPhase("ready");
       setClipLoading(false);
@@ -233,7 +265,7 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
     }
     if (cachedDump) {
       setDump(cachedDump);
-      setTick(cachedDump.startTick);
+      paintPlayhead(cachedDump.startTick, cachedDump, true);
       setStageClipId(selected.id);
       setPhase("ready");
       setClipLoading(false);
@@ -314,7 +346,7 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
         });
         putCachedDump(selected.id, mergedDump);
         setDump(mergedDump);
-        setTick(mergedDump.startTick);
+        paintPlayhead(mergedDump.startTick, mergedDump, true);
         setStageClipId(selected.id);
         setPlaying(false);
         setClipLoading(false);
@@ -514,39 +546,35 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
 
   useEffect(() => {
     if (!prepared || !dump || autoStarted) return;
-    setTick(dump.startTick);
+    paintPlayhead(dump.startTick, dump, true);
     setPlaying(true);
     setAutoStarted(true);
-  }, [prepared, dump, autoStarted]);
+  }, [prepared, dump, autoStarted, paintPlayhead]);
 
   useEffect(() => {
     if (!playing || !dump) return;
     let raf = 0;
     let last = performance.now();
-    const msPerTick = 1000 / Math.max(dump.tickrate, 1);
     const step = () => {
+      if (!playingRef.current) return;
+      const current = dumpRef.current;
+      if (!current) return;
       const now = performance.now();
       const dt = now - last;
       last = now;
-      setTick((cur) => {
-        const next = cur + dt / msPerTick;
-        if (next >= dump.endTick) {
-          setPlaying(false);
-          return dump.endTick;
-        }
-        return next;
-      });
+      const msPerTick = 1000 / Math.max(current.tickrate, 1);
+      const next = tickRef.current + dt / msPerTick;
+      if (next >= current.endTick) {
+        paintPlayhead(current.endTick, current, true);
+        setPlaying(false);
+        return;
+      }
+      paintPlayhead(next, current, true);
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-  }, [playing, dump]);
-
-  const overlayKills = useMemo(() => {
-    if (!selected || !dump) return [];
-    const windowTicks = dump.tickrate * 5;
-    return selected.moment.kills.filter((kill) => kill.tick <= tick && tick - kill.tick <= windowTicks);
-  }, [selected, dump, tick]);
+  }, [playing, dump, paintPlayhead]);
 
   const you = match?.payload?.you;
   const gaps = describeGaps(assets);
@@ -617,10 +645,10 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
             {selected ? (
               <ClipStageBoundary>
                 <ClipStage
+                  ref={stageRef}
                   dump={dump}
                   clipId={stageClipId}
-                  tick={tick}
-                  kills={selected?.moment.kills ?? []}
+                  kills={selected?.moment.kills ?? EMPTY_KILLS}
                   assets={assets}
                   assetsReady={assetsReady}
                   vmPrefs={vmPrefs}
@@ -717,19 +745,22 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
                 {playing ? "Pause" : "Play"}
               </button>
               <input
+                ref={scrubRef}
                 type="range"
                 min={dump.startTick}
                 max={dump.endTick}
-                value={Math.round(tick)}
-                onChange={(event) => {
+                defaultValue={dump.startTick}
+                onInput={(event) => {
+                  const current = dumpRef.current;
+                  if (!current) return;
                   setPlaying(false);
-                  setTick(Number(event.target.value));
+                  paintPlayhead(Number(event.currentTarget.value), current, false);
                 }}
                 disabled={!prepared}
                 className="min-w-0 flex-1"
               />
-              <span className="w-16 text-right text-xs tabular-nums text-muted">
-                {((tick - dump.startTick) / dump.tickrate).toFixed(1)}s
+              <span ref={timeRef} className="w-16 text-right text-xs tabular-nums text-muted">
+                0.0s
               </span>
             </div>
           )}
