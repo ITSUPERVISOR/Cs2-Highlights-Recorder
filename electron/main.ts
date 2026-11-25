@@ -575,7 +575,14 @@ app.whenReady().then(async () => {
       if (!cachePath || !existsSync(cachePath)) {
         throw new Error(result.stderr || "preview produced no pose cache");
       }
-      return JSON.parse(readFileSync(cachePath, "utf8"));
+      // The renderer reads the pose file through reelmap://. Parsing it here
+      // would copy the whole clip through the main process.
+      return {
+        cachePath,
+        cached: Boolean(meta.cached),
+        map: meta.map ?? "",
+        mapSource: meta.mapSource ?? "",
+      };
     },
   );
   ipcMain.handle("core:previewMap", async (_e, mapName: string, quality?: string) => {
@@ -618,11 +625,15 @@ app.whenReady().then(async () => {
     const queue = listQueue();
     if (!queue.length) throw new Error("Queue is empty");
     mkdirSync(settings.outputDir, { recursive: true });
-    const byMatch = new Map<string, { demoPath: string; moments: unknown[] }>();
+    const byMatch = new Map<string, { demoPath: string; moments: unknown[]; payload: unknown }>();
     for (const item of queue) {
       const match = getMatch(item.matchId);
       if (!match) continue;
-      const bucket = byMatch.get(match.id) ?? { demoPath: match.demoPath, moments: [] };
+      const bucket = byMatch.get(match.id) ?? {
+        demoPath: match.demoPath,
+        moments: [] as unknown[],
+        payload: match.payload,
+      };
       bucket.moments.push(item.moment);
       byMatch.set(match.id, bucket);
     }
@@ -631,6 +642,13 @@ app.whenReady().then(async () => {
       const momentsPath = join(app.getPath("temp"), `reel-moments-${matchId.replace(/[^\w]/g, "")}.json`);
       writeFileSync(momentsPath, JSON.stringify(job.moments, null, 2));
       const args = ["record", job.demoPath, "--moments", momentsPath, "--out", settings.outputDir, "--json"];
+      const saved = job.payload as { slots?: Record<string, unknown> } | null;
+      const slots = saved && typeof saved === "object" ? saved.slots : null;
+      if (slots && typeof slots === "object" && Object.keys(slots).length > 0) {
+        const libraryPath = join(app.getPath("temp"), `reel-library-${matchId.replace(/[^\w]/g, "")}.json`);
+        writeFileSync(libraryPath, JSON.stringify(saved));
+        args.push("--library", libraryPath);
+      }
       if (settings.steamId) args.push("--player", settings.steamId);
       const result = await runCore(args, 3_600_000);
       if (result.code !== 0) {

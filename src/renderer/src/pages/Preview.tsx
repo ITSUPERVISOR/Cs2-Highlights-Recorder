@@ -70,6 +70,13 @@ function safeDump(dump: PreviewDump): PreviewDump {
   return stripUnsafeMap(dump);
 }
 
+async function loadPoseDump(cachePath: string): Promise<PreviewDump> {
+  const url = `reelmap://asset/?path=${encodeURIComponent(cachePath.replace(/\\/g, "/"))}`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("The pose cache could not be read.");
+  return (await response.json()) as PreviewDump;
+}
+
 function prefsFromSettings(settings: ReelSettings | null): ViewmodelPrefs {
   if (!settings) return DEFAULT_VIEWMODEL;
   const preset = isPreviewVmPreset(settings.previewVmPreset) ? settings.previewVmPreset : "cs";
@@ -323,14 +330,17 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
           setMapExporting(true);
         }
 
-        const payload = (await window.reel.previewClip(
+        const meta = (await window.reel.previewClip(
           row.demoPath,
           start,
           end,
           selected.moment.steamid,
           mapName,
           tickrate,
-        )) as PreviewDump;
+        )) as { cachePath?: string };
+        if (cancelled) return;
+        if (!meta?.cachePath) throw new Error("preview produced no pose cache");
+        const payload = await loadPoseDump(meta.cachePath);
         if (cancelled) return;
         const mergedDump = safeDump({
           ...payload,

@@ -770,11 +770,20 @@ def dump_clip_trajectory(
     cache_file = work / f"{key}.json"
     if cache_file.is_file():
         try:
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if cached.get("frames"):
-                cached["cachePath"] = str(cache_file)
-                return cached
-        except (OSError, ValueError):
+            # A cache hit must not parse the pose dump. The UI reads the file itself.
+            if cache_file.stat().st_size > 64:
+                with cache_file.open("rb") as handle:
+                    cached_header = handle.read(1) == b"{"
+                if cached_header:
+                    return {
+                        "cached": True,
+                        "cachePath": str(cache_file),
+                        "map": map_name,
+                        "mapSource": "",
+                        "frames": [],
+                        "povSteamid": pov,
+                    }
+        except OSError:
             pass
 
     ticks = list(range(int(start_tick), int(end_tick) + 1, max(1, stride)))
