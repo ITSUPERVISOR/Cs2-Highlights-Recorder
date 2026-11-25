@@ -642,16 +642,25 @@ app.whenReady().then(async () => {
     const queue = listQueue();
     if (!queue.length) throw new Error("Queue is empty");
     mkdirSync(settings.outputDir, { recursive: true });
-    const byMatch = new Map<string, { demoPath: string; moments: unknown[]; payload: unknown }>();
+    const byMatch = new Map<
+      string,
+      { demoPath: string; moments: unknown[]; payload: unknown; queueIds: string[] }
+    >();
+    const failures: { demoPath: string; error: string }[] = [];
     for (const item of queue) {
       const match = getMatch(item.matchId);
-      if (!match) continue;
+      if (!match) {
+        failures.push({ demoPath: item.matchId, error: "That match is no longer in the library." });
+        continue;
+      }
       const bucket = byMatch.get(match.id) ?? {
         demoPath: match.demoPath,
         moments: [] as unknown[],
         payload: match.payload,
+        queueIds: [] as string[],
       };
       bucket.moments.push(item.moment);
+      bucket.queueIds.push(item.id);
       byMatch.set(match.id, bucket);
     }
     const clips: string[] = [];
@@ -669,7 +678,8 @@ app.whenReady().then(async () => {
       if (settings.steamId) args.push("--player", settings.steamId);
       const result = await runCore(args, 3_600_000);
       if (result.code !== 0) {
-        throw new Error(result.stderr || result.stdout || "record failed");
+        failures.push({ demoPath: job.demoPath, error: recordFailureText(result.stderr, result.stdout) });
+        continue;
       }
       const payload = parseJsonOutput(result.stdout);
       clips.push(...(payload.clips ?? []));
@@ -678,14 +688,26 @@ app.whenReady().then(async () => {
         "recorded",
         matchId,
       ]);
+      for (const queueId of job.queueIds) db.run("DELETE FROM queue WHERE id = ?", [queueId]);
+      flushDb();
     }
-    db.run("DELETE FROM queue");
     flushDb();
-    return { clips, outDir: settings.outputDir };
+    return { clips, outDir: settings.outputDir, failures };
   });
 
   createWindow();
 });
+
+function recordFailureText(stderr: string, stdout: string) {
+  const text = (stderr || stdout || "record failed").trim();
+  const line = text
+    .split(/\r?\n/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .pop();
+  const message = line || "record failed";
+  return message.length > 400 ? `${message.slice(0, 400)}…` : message;
+}
 
 function applyPlayerFocus(payload: Record<string, unknown>, steamid: string) {
   const players = (payload.players as { steamid?: string }[] | undefined) ?? [];
