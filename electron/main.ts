@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import initSqlJs, { type Database } from "sql.js";
 import { isDemoFileName, listDemoFiles } from "./demoScan";
+import { previewWindow } from "../src/renderer/src/lib/previewWindow";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "../..");
@@ -520,6 +521,7 @@ app.whenReady().then(async () => {
       Date.now(),
     ]);
     persistDb();
+    schedulePreviewWarm(matchId, moment);
     return listQueue();
   });
   ipcMain.handle("queue:remove", (_e, id: string) => {
@@ -791,6 +793,40 @@ function listQueue() {
     moment: JSON.parse(String(row[2])),
     addedAt: Number(row[3]),
   }));
+}
+
+let previewWarm: Promise<unknown> = Promise.resolve();
+
+function schedulePreviewWarm(matchId: string, moment: unknown) {
+  if (!moment || typeof moment !== "object") return;
+  const row = moment as { firstTick?: unknown; lastTick?: unknown; steamid?: unknown };
+  const firstTick = Number(row.firstTick);
+  const lastTick = Number(row.lastTick);
+  const steamid = String(row.steamid ?? "");
+  if (!steamid || !Number.isFinite(firstTick) || !Number.isFinite(lastTick)) return;
+  const match = getMatch(matchId);
+  if (!match?.demoPath) return;
+  const tickrate = Number(match.payload?.tickrate) || 64;
+  const mapName = String(match.payload?.map ?? match.map ?? "");
+  const clip = previewWindow({ firstTick, lastTick }, tickrate);
+  if (!clip) return;
+  const args = [
+    "preview",
+    match.demoPath,
+    "--start",
+    String(clip.start),
+    "--end",
+    String(clip.end),
+    "--player",
+    steamid,
+    "--map-name",
+    mapName,
+    "--tickrate",
+    String(tickrate),
+    "--json",
+  ];
+  // One clip at a time, and never fail the queue click if the warm-up misses.
+  previewWarm = previewWarm.catch(() => undefined).then(() => runCore(args, 300_000).catch(() => undefined));
 }
 
 app.on("before-quit", () => {
