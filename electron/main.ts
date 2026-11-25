@@ -69,10 +69,27 @@ function asNumber(value: string | undefined, fallback: number): number {
 let db: Database;
 let dbPath = "";
 let mainWindow: BrowserWindow | null = null;
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
-function persistDb() {
+/** How long a burst of library edits waits before one database export. */
+const PERSIST_DELAY_MS = 200;
+
+function flushDb() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  if (!db || !dbPath) return;
   mkdirSync(dirname(dbPath), { recursive: true });
   writeFileSync(dbPath, Buffer.from(db.export()));
+}
+
+function persistDb() {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    flushDb();
+  }, PERSIST_DELAY_MS);
 }
 
 function initSchema() {
@@ -405,7 +422,7 @@ app.whenReady().then(async () => {
     db = new SQL.Database();
   }
   initSchema();
-  persistDb();
+  flushDb();
   armFolderWatch();
 
   ipcMain.handle("settings:get", () => getSettings());
@@ -663,7 +680,7 @@ app.whenReady().then(async () => {
       ]);
     }
     db.run("DELETE FROM queue");
-    persistDb();
+    flushDb();
     return { clips, outDir: settings.outputDir };
   });
 
@@ -687,7 +704,16 @@ function listMatches() {
 }
 
 function getMatch(id: string) {
-  return listMatches().find((match) => match.id === id) ?? null;
+  const stmt = db.prepare(
+    "SELECT id, demo_path, map, imported_at, status, payload, recorded_count FROM matches WHERE id = ?",
+  );
+  try {
+    stmt.bind([id]);
+    if (!stmt.step()) return null;
+    return rowToMatch(stmt.get());
+  } finally {
+    stmt.free();
+  }
 }
 
 function rowToMatch(row: unknown[]) {
@@ -714,7 +740,11 @@ function listQueue() {
   }));
 }
 
+app.on("before-quit", () => {
+  flushDb();
+});
+
 app.on("window-all-closed", () => {
-  persistDb();
+  flushDb();
   app.quit();
 });
