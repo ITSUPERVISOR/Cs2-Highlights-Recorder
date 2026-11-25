@@ -105,6 +105,7 @@ function initSchema() {
       imported_at INTEGER NOT NULL,
       status TEXT NOT NULL DEFAULT 'new',
       payload TEXT,
+      summary TEXT,
       recorded_count INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS queue (
@@ -114,6 +115,11 @@ function initSchema() {
       added_at INTEGER NOT NULL
     );
   `);
+  const columns = db.exec("PRAGMA table_info(matches)")[0]?.values ?? [];
+  const names = new Set(columns.map((row) => String(row[1])));
+  if (!names.has("summary")) {
+    db.run("ALTER TABLE matches ADD COLUMN summary TEXT");
+  }
 }
 
 function getSettings(): Settings {
@@ -506,8 +512,10 @@ app.whenReady().then(async () => {
       throw new Error(result.stderr || result.stdout || "parse failed");
     }
     const payload = parseJsonOutput(result.stdout);
-    db.run("UPDATE matches SET payload = ?, map = ?, status = ? WHERE id = ?", [
-      JSON.stringify(payload),
+    const stored = JSON.stringify(payload);
+    db.run("UPDATE matches SET payload = ?, summary = ?, map = ?, status = ? WHERE id = ?", [
+      stored,
+      JSON.stringify(matchSummary(payload)),
       payload.map ?? null,
       "parsed",
       id,
@@ -520,8 +528,9 @@ app.whenReady().then(async () => {
     const match = getMatch(id);
     if (!match?.payload) throw new Error("match not found");
     const payload = applyPlayerFocus(match.payload, steamid);
-    db.run("UPDATE matches SET payload = ?, status = ? WHERE id = ?", [
+    db.run("UPDATE matches SET payload = ?, summary = ?, status = ? WHERE id = ?", [
       JSON.stringify(payload),
+      JSON.stringify(matchSummary(payload)),
       "reviewed",
       id,
     ]);
@@ -717,12 +726,38 @@ function applyPlayerFocus(payload: Record<string, unknown>, steamid: string) {
   return { ...payload, playerSteamid: steamid, you, highlightCount };
 }
 
+function matchSummary(payload: Record<string, unknown> | null) {
+  if (!payload) return null;
+  return {
+    playerSteamid: (payload.playerSteamid as string | null) ?? null,
+    scoreline: (payload.scoreline as { ct: number; t: number } | null) ?? null,
+    highlightCount: Number(payload.highlightCount ?? 0),
+    you: (payload.you as Record<string, unknown> | null) ?? null,
+  };
+}
+
+function backfillSummaries() {
+  const rows = db.exec("SELECT id, payload FROM matches WHERE summary IS NULL AND payload IS NOT NULL");
+  const values = rows[0]?.values ?? [];
+  if (!values.length) return;
+  for (const row of values) {
+    try {
+      const payload = JSON.parse(String(row[1])) as Record<string, unknown>;
+      db.run("UPDATE matches SET summary = ? WHERE id = ?", [JSON.stringify(matchSummary(payload)), String(row[0])]);
+    } catch {
+      /* leave the row for a later parse */
+    }
+  }
+  persistDb();
+}
+
 function listMatches() {
+  backfillSummaries();
   const rows = db.exec(
-    "SELECT id, demo_path, map, imported_at, status, payload, recorded_count FROM matches ORDER BY imported_at DESC",
+    "SELECT id, demo_path, map, imported_at, status, summary, recorded_count FROM matches ORDER BY imported_at DESC",
   );
   if (!rows[0]) return [];
-  return rows[0].values.map((row) => rowToMatch(row));
+  return rows[0].values.map((row) => rowToListMatch(row));
 }
 
 function getMatch(id: string) {
@@ -738,15 +773,39 @@ function getMatch(id: string) {
   }
 }
 
-function rowToMatch(row: unknown[]) {
-  const payloadRaw = row[5] ? String(row[5]) : null;
+function rowToListMatch(row: unknown[]) {
+  const summaryRaw = row[5] ? String(row[5]) : null;
+  let summary = null;
+  if (summaryRaw) {
+    try {
+      summary = JSON.parse(summaryRaw);
+    } catch {
+      summary = null;
+    }
+  }
   return {
     id: String(row[0]),
     demoPath: String(row[1]),
     map: row[2] ? String(row[2]) : null,
     importedAt: Number(row[3]),
     status: String(row[4]),
-    payload: payloadRaw ? JSON.parse(payloadRaw) : null,
+    summary,
+    payload: null,
+    recordedCount: Number(row[6] ?? 0),
+  };
+}
+
+function rowToMatch(row: unknown[]) {
+  const payloadRaw = row[5] ? String(row[5]) : null;
+  const payload = payloadRaw ? JSON.parse(payloadRaw) : null;
+  return {
+    id: String(row[0]),
+    demoPath: String(row[1]),
+    map: row[2] ? String(row[2]) : null,
+    importedAt: Number(row[3]),
+    status: String(row[4]),
+    summary: matchSummary(payload),
+    payload,
     recordedCount: Number(row[6] ?? 0),
   };
 }
