@@ -54,6 +54,83 @@ EXTRA_FIELDS = (
     "fall_back_paint_kit",
 )
 
+# One demo pass for every event the clip needs. A second call used to rescan
+# the file for each of these names.
+CLIP_EVENTS = (
+    "fire_bullets",
+    "weapon_fire",
+    "bullet_damage",
+    "player_hurt",
+    "player_blind",
+    "weapon_reload",
+    "item_equip",
+    "weapon_zoom",
+    "smokegrenade_detonate",
+    "smokegrenade_expired",
+    "inferno_startburn",
+    "inferno_expire",
+    "hegrenade_detonate",
+    "flashbang_detonate",
+    "bomb_planted",
+    "bomb_dropped",
+    "bomb_pickup",
+    "bomb_defused",
+    "bomb_exploded",
+    "round_end",
+    "round_officially_ended",
+    "begin_new_match",
+)
+
+
+class _EventSource:
+    """Events for one clip, read in a single pass when the parser allows it."""
+
+    def __init__(self, parser: DemoParser) -> None:
+        self._parser = parser
+        self._events: dict[str, pd.DataFrame] | None = None
+
+    def load(self, names: tuple[str, ...] | list[str]) -> None:
+        parse_events = getattr(self._parser, "parse_events", None)
+        if parse_events is None:
+            return
+        # Player positions let bomb plants keep their coordinates. If a build
+        # rejects that, the names alone are still one pass.
+        for kwargs in ({"player": ["X", "Y", "Z"]}, {}):
+            try:
+                pairs = parse_events(list(names), **kwargs)
+            except Exception:
+                continue
+            loaded: dict[str, pd.DataFrame] = {}
+            for item in pairs or []:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    continue
+                name, frame = item
+                loaded[str(name)] = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+            self._events = loaded
+            return
+
+    def event(self, name: str, **kwargs) -> pd.DataFrame:
+        if kwargs or self._events is None:
+            return _safe_event(self._parser, name, **kwargs)
+        frame = self._events.get(name)
+        return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    def parse_grenades(self):
+        return self._parser.parse_grenades()
+
+    def parse_event(self, name: str, **kwargs):
+        return self.event(name, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._parser, name)
+
+
+def _event(parser: DemoParser, name: str, **kwargs) -> pd.DataFrame:
+    batched = getattr(parser, "event", None)
+    if batched is not None and not kwargs:
+        return batched(name)
+    return _safe_event(parser, name, **kwargs)
+
 
 def preview_cache_dir() -> Path:
     path = app_data_dir() / "previews"
@@ -133,6 +210,18 @@ def _team(row: pd.Series) -> str:
     if num == 3:
         return "CT"
     return ""
+
+
+def _parse_clip_ticks(parser: DemoParser, ticks: list[int]) -> pd.DataFrame:
+    """Poses and optional props in one read, falling back to separate reads."""
+    combined = list(dict.fromkeys([*POSE_FIELDS, *EXTRA_FIELDS]))
+    try:
+        df = parser.parse_ticks(combined, ticks=ticks)
+    except Exception:
+        df = None
+    if df is not None and not df.empty and "X" in df.columns:
+        return df
+    return _merge_extras(_parse_pose_ticks(parser, ticks), _parse_extra_ticks(parser, ticks))
 
 
 def _parse_pose_ticks(parser: DemoParser, ticks: list[int]) -> pd.DataFrame:
@@ -311,16 +400,16 @@ def _shots_in_window(parser: DemoParser, start_tick: int, end_tick: int) -> list
     actually travelled. Knives and grenades appear only in `weapon_fire`, so
     driving off `fire_bullets` correctly yields no tracer for them.
     """
-    fires = _safe_event(parser, "fire_bullets")
+    fires = _event(parser, "fire_bullets")
     if fires.empty or "tick" not in fires.columns:
         return []
     window = fires[(fires["tick"] >= start_tick) & (fires["tick"] <= end_tick)]
     if window.empty:
         return []
 
-    names = _index_by_shooter(_safe_event(parser, "weapon_fire"), "user_steamid")
-    damage = _index_by_shooter(_safe_event(parser, "bullet_damage"), "attacker_steamid")
-    hurts = _index_by_shooter(_safe_event(parser, "player_hurt"), "attacker_steamid")
+    names = _index_by_shooter(_event(parser, "weapon_fire"), "user_steamid")
+    damage = _index_by_shooter(_event(parser, "bullet_damage"), "attacker_steamid")
+    hurts = _index_by_shooter(_event(parser, "player_hurt"), "attacker_steamid")
 
     shots: list[dict] = []
     for _, row in window.iterrows():
@@ -380,7 +469,7 @@ def _throws_in_window(
     parser: DemoParser, start_tick: int, end_tick: int, lookback_ticks: int = 0
 ) -> list[dict]:
     """Grenade `weapon_fire` events. Kept off `shots` so they do not spawn tracers."""
-    df = _safe_event(parser, "weapon_fire")
+    df = _event(parser, "weapon_fire")
     if df.empty or "tick" not in df.columns:
         return []
     floor = int(start_tick) - max(0, int(lookback_ticks))
@@ -413,7 +502,7 @@ def _blinds_in_window(
     fade. The event also gives each victim their own duration: the same flashbang
     blinds one player for 0.13s and another for 3.09s.
     """
-    df = _safe_event(parser, "player_blind")
+    df = _event(parser, "player_blind")
     if df.empty or "tick" not in df.columns:
         return []
     rate = max(float(tickrate), 1.0)
@@ -455,7 +544,7 @@ def _player_events(
     read from `m_bIsScoped`, and `item_equip` fires thousands of times at round
     start, so the window filter is not optional.
     """
-    df = _safe_event(parser, name)
+    df = _event(parser, name)
     if df.empty or "tick" not in df.columns:
         return []
     floor = int(start_tick) - max(0, int(lookback_ticks))
@@ -551,7 +640,7 @@ def _grenades_in_window(
 
 def _detonations(parser: DemoParser, name: str) -> pd.DataFrame:
     """One of the grenade effect events, all of which share entityid/tick/x/y/z."""
-    df = _safe_event(parser, name)
+    df = _event(parser, name)
     if df.empty or not {"tick", "x", "y", "z"}.issubset(set(df.columns)):
         return pd.DataFrame()
     return df.dropna(subset=["x", "y", "z"])
@@ -609,7 +698,7 @@ def _timed_volumes(
 
 
 def _event_ticks(parser: DemoParser, name: str) -> list[int]:
-    df = _safe_event(parser, name)
+    df = _event(parser, name)
     if df.empty or "tick" not in df.columns:
         return []
     out: list[int] = []
@@ -647,9 +736,7 @@ def _pose_xyz(frames: list[dict], tick: int, steamid: str) -> tuple[float, float
 
 def _bomb_starts(parser: DemoParser, name: str) -> list[dict]:
     """Plant/drop events with the carrier's position at that tick."""
-    df = _safe_event(parser, name, player=["X", "Y", "Z"])
-    if df.empty:
-        df = _safe_event(parser, name)
+    df = _event(parser, name)
     if df.empty or "tick" not in df.columns:
         return []
     out: list[dict] = []
@@ -787,14 +874,14 @@ def dump_clip_trajectory(
             pass
 
     ticks = list(range(int(start_tick), int(end_tick) + 1, max(1, stride)))
-    parser = DemoParser(str(dem))
+    parser = _EventSource(DemoParser(str(dem)))
+    parser.load(CLIP_EVENTS)
     header = {}
     try:
         header = parser.parse_header() or {}
     except Exception:
         pass
-    df = _parse_pose_ticks(parser, ticks)
-    df = _merge_extras(df, _parse_extra_ticks(parser, ticks))
+    df = _parse_clip_ticks(parser, ticks)
     frames = frames_from_dataframe(df)
     if not frames:
         raise RuntimeError("No player positions in this clip window")
