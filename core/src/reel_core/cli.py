@@ -578,6 +578,20 @@ def preview(
     )
 
 
+@main.command(name="warm-preview")
+@click.argument("demo", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--json", "as_json", is_flag=True)
+def warm_preview(demo: Path, as_json: bool) -> None:
+    """Cache demo-wide preview data so the first clip does not rescan the file."""
+    from reel_core.demo.trajectory import warm_preview_caches
+
+    payload = warm_preview_caches(demo)
+    if as_json:
+        click.echo(json.dumps(payload))
+        return
+    info(f"Preview warm  events={payload['events']}  grenades={payload['grenades']}")
+
+
 @main.command(name="preview-map")
 @click.argument("map_name")
 @click.option("--quality", type=click.Choice(["low", "medium", "high"]), default="low")

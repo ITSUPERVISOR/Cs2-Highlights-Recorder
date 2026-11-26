@@ -1035,6 +1035,19 @@ def _bursts(parser: DemoParser, start_tick: int, end_tick: int) -> list[dict]:
     return out
 
 
+def warm_preview_caches(demo_path: Path) -> dict:
+    """Save this demo's events and grenade flights before any clip is opened.
+
+    Every clip of a match needs the same two scans. Doing them once, while the
+    user is still on the scoreboard, leaves the first preview with only its poses.
+    """
+    dem = ensure_dem_file(demo_path, preview_cache_dir() / "dem")
+    source = _EventSource(DemoParser(str(dem)))
+    source.load(CLIP_EVENTS, dem)
+    rows = _load_projectile_rows(source, dem)
+    return {"ok": True, "events": source._events is not None, "grenades": int(len(rows))}
+
+
 def dump_clip_trajectory(
     demo_path: Path,
     *,
