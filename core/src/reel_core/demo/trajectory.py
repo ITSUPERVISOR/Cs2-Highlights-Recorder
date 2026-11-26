@@ -36,9 +36,12 @@ POSE_FIELDS = (
     "team_num",
     "active_weapon_name",
     "weapon_name",
-    "ducking",
-    "is_ducking",
 )
+
+# demoparser's `ducking` alias walks much more of the file than the raw crouch
+# amount, even for a handful of ticks. The amount rides along with the other
+# props. The boolean is only read when a demo has no amount.
+DUCK_AMOUNT = "CCSPlayerPawn.CCSPlayer_MovementServices.m_flDuckAmount"
 
 # Raw netprops for the extras. These are parsed apart from POSE_FIELDS: the
 # pose fallback ladder drops whole field *sets*, so bundling these in would mean
@@ -48,7 +51,7 @@ EXTRA_FIELDS = (
     PUNCH_FIELD,
     "CCSPlayerPawn.m_bIsScoped",
     "CCSPlayerPawn.m_bIsWalking",
-    "CCSPlayerPawn.CCSPlayer_MovementServices.m_flDuckAmount",
+    DUCK_AMOUNT,
     "CCSPlayerPawn.m_ArmorValue",
     "CCSPlayerPawn.m_szLastPlaceName",
     "active_weapon_skin",
@@ -294,6 +297,26 @@ def _team(row: pd.Series) -> str:
     return ""
 
 
+def _duck_boolean(parser: DemoParser, ticks: list[int]) -> pd.DataFrame:
+    """Slow crouch boolean, used only when the demo has no crouch amount."""
+    try:
+        df = parser.parse_ticks(["ducking"], ticks=ticks)
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty or "ducking" not in df.columns:
+        return pd.DataFrame()
+    keep = [column for column in ("tick", "steamid", "ducking") if column in df.columns]
+    if len(keep) < 3:
+        return pd.DataFrame()
+    return df[keep]
+
+
+def _with_duck_fallback(parser: DemoParser, ticks: list[int], df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or DUCK_AMOUNT in df.columns or "ducking" in df.columns:
+        return df
+    return _merge_extras(df, _duck_boolean(parser, ticks))
+
+
 def _parse_clip_ticks(parser: DemoParser, ticks: list[int]) -> pd.DataFrame:
     """Poses and optional props in one read, falling back to separate reads."""
     combined = list(dict.fromkeys([*POSE_FIELDS, *EXTRA_FIELDS]))
@@ -302,8 +325,12 @@ def _parse_clip_ticks(parser: DemoParser, ticks: list[int]) -> pd.DataFrame:
     except Exception:
         df = None
     if df is not None and not df.empty and "X" in df.columns:
-        return df
-    return _merge_extras(_parse_pose_ticks(parser, ticks), _parse_extra_ticks(parser, ticks))
+        return _with_duck_fallback(parser, ticks, df)
+    return _with_duck_fallback(
+        parser,
+        ticks,
+        _merge_extras(_parse_pose_ticks(parser, ticks), _parse_extra_ticks(parser, ticks)),
+    )
 
 
 def _parse_pose_ticks(parser: DemoParser, ticks: list[int]) -> pd.DataFrame:
@@ -389,11 +416,14 @@ def frames_from_dataframe(df: pd.DataFrame) -> list[dict]:
         health = _num(row, "health", default=100.0)
         if health <= 0:
             alive = False
-        duck_amount = _num(row, "CCSPlayerPawn.CCSPlayer_MovementServices.m_flDuckAmount", default=-1.0)
+        duck_amount = _num(row, DUCK_AMOUNT, default=-1.0)
+        has_duck_bool = _cell(row, "ducking") is not _MISSING or _cell(row, "is_ducking") is not _MISSING
         ducking = _bool(row, "ducking", "is_ducking", default=False)
         if duck_amount < 0:
             # No duck amount in this demo: fall back to the boolean.
             duck_amount = 1.0 if ducking else 0.0
+        elif not has_duck_bool:
+            ducking = duck_amount > 0
         players[steamid] = {
             "x": round(_num(row, "X"), 2),
             "y": round(_num(row, "Y"), 2),
