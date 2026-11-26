@@ -113,3 +113,69 @@ def test_frames_group_players_without_iterrows():
     throws = trajectory._throws_in_window(source, 0, 100)
     assert throws[0]["tick"] == 10
     assert parser.passes == 3
+
+
+def test_quiet_clip_does_not_scan_grenade_flights():
+    loaded = {name: pd.DataFrame(columns=["tick", "weapon", "x", "y", "z"]) for name in trajectory._FLIGHT_EVENTS}
+    calls = {"n": 0}
+
+    class Counting:
+        def parse_grenades(self):
+            calls["n"] += 1
+            return pd.DataFrame()
+
+    parser = trajectory._EventSource(Counting())
+    parser._events = loaded
+
+    assert trajectory._grenades_in_window(parser, 1000, 1200, 2) == []
+    assert calls["n"] == 0
+
+
+def test_grenade_flights_are_reused_for_the_same_demo(tmp_path, monkeypatch):
+    monkeypatch.setattr(trajectory, "preview_cache_dir", lambda: tmp_path)
+    demo = tmp_path / "match.dem"
+    demo.write_bytes(b"not a real demo")
+    grenades = pd.DataFrame(
+        [
+            {"grenade_type": "CFlashbang", "grenade_entity_id": 1, "x": None, "y": None, "z": None, "tick": 10},
+            {"grenade_type": "CFlashbangProjectile", "grenade_entity_id": 2, "x": 1.0, "y": 2.0, "z": 3.0, "tick": 10},
+            {"grenade_type": "CFlashbangProjectile", "grenade_entity_id": 2, "x": 4.0, "y": 5.0, "z": 6.0, "tick": 12},
+            {"grenade_type": "CFlashbangProjectile", "grenade_entity_id": 2, "x": 9.0, "y": 9.0, "z": 9.0, "tick": 80},
+        ]
+    )
+    calls = {"n": 0}
+
+    class Counting:
+        def parse_grenades(self):
+            calls["n"] += 1
+            return grenades
+
+    class Boom:
+        def parse_grenades(self):
+            raise AssertionError("grenade flights were scanned again")
+
+    first = trajectory._grenades_in_window(Counting(), 0, 20, 1, demo)
+    assert calls["n"] == 1
+    assert len(first) == 1
+    assert [point["tick"] for point in first[0]["points"]] == [10, 12]
+    second = trajectory._grenades_in_window(Boom(), 0, 20, 1, demo)
+    assert second == first
+
+
+def test_clip_events_are_reused_for_the_same_demo(tmp_path, monkeypatch):
+    monkeypatch.setattr(trajectory, "preview_cache_dir", lambda: tmp_path)
+    demo = tmp_path / "match.dem"
+    demo.write_bytes(b"demo")
+    parser = _EventParser()
+    source = trajectory._EventSource(parser)
+    source.load(CLIP_EVENTS, demo)
+    assert parser.passes == 1
+    assert trajectory._throws_in_window(source, 0, 100)[0]["tick"] == 10
+
+    class Boom:
+        def parse_events(self, _names, **_kwargs):
+            raise AssertionError("events were scanned again")
+
+    again = trajectory._EventSource(Boom())
+    again.load(CLIP_EVENTS, demo)
+    assert trajectory._throws_in_window(again, 0, 100)[0]["tick"] == 10
