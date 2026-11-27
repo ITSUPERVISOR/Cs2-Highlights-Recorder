@@ -5,6 +5,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import initSqlJs, { type Database } from "sql.js";
+import { isDemoFileName, listDemoFiles } from "./demoScan";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "../..");
@@ -265,42 +266,9 @@ function normalizeDemoPath(filePath: string) {
   return filePath.replace(/\\/g, "/").toLowerCase();
 }
 
-function listDemoFiles(folders: string[]) {
-  const { readdirSync, statSync } = require("node:fs") as typeof import("node:fs");
-  const byPath = new Map<string, { path: string; size: number; mtime: number }>();
-  const exts = [".dem", ".dem.gz", ".dem.zst"];
-  for (const folder of folders) {
-    if (!existsSync(folder)) continue;
-    const walk = (dir: string, depth: number) => {
-      if (depth > 4) return;
-      let entries: string[] = [];
-      try {
-        entries = readdirSync(dir);
-      } catch {
-        return;
-      }
-      for (const name of entries) {
-        const full = join(dir, name);
-        let stat;
-        try {
-          stat = statSync(full);
-        } catch {
-          continue;
-        }
-        if (stat.isDirectory()) walk(full, depth + 1);
-        else if (exts.some((ext) => name.toLowerCase().endsWith(ext))) {
-          byPath.set(normalizeDemoPath(full), { path: full, size: stat.size, mtime: stat.mtimeMs });
-        }
-      }
-    };
-    walk(folder, 0);
-  }
-  return [...byPath.values()];
-}
-
-function importNewDemos() {
+function importNewDemos(fresh = false) {
   const settings = getSettings();
-  const files = listDemoFiles(settings.folders);
+  const files = listDemoFiles(settings.folders, fresh);
   const known = new Set(
     (db.exec("SELECT id, demo_path FROM matches")[0]?.values ?? []).flatMap((row) => [
       String(row[0]),
@@ -332,7 +300,11 @@ function armFolderWatch() {
     if (!existsSync(folder)) continue;
     try {
       folderWatchers.push(
-        watch(folder, { recursive: true }, () => {
+        watch(folder, { recursive: true }, (_event, filename) => {
+          if (typeof filename === "string" && filename.length > 0) {
+            const base = filename.split(/[/\\]/).pop() ?? filename;
+            if (base.includes(".") && !isDemoFileName(base)) return;
+          }
           if (scanTimer) clearTimeout(scanTimer);
           scanTimer = setTimeout(() => {
             importNewDemos();
@@ -490,7 +462,7 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle("library:scan", () => {
-    const matches = importNewDemos();
+    const matches = importNewDemos(true);
     armFolderWatch();
     return matches;
   });
