@@ -10,6 +10,7 @@ import { invalidateGltfCache } from "../lib/loadGltf";
 import { mergeAssetBundles, type AssetBundle } from "../lib/gameAssets";
 import { getCachedDump, putCachedDump, getWarmClip, putWarmClip, getSharedAssets, putSharedAssets } from "../lib/clipCache";
 import { stripUnsafeMap } from "../lib/loadMapGltf";
+import { previewWindow } from "../lib/previewWindow";
 import { adrTone, ratingTone, toneClass } from "../lib/statColors";
 import {
   DEFAULT_VIEWMODEL,
@@ -302,8 +303,9 @@ export function PreviewPage({ onOpenQueue }: { onOpenQueue: () => void }) {
         if (!row) throw new Error("That match is no longer in the library.");
         setMatch(row);
         const tickrate = row.payload?.tickrate || 64;
-        const start = Math.max(96, Math.floor(selected.moment.firstTick - 4 * tickrate));
-        const end = Math.floor(selected.moment.lastTick + 3 * tickrate);
+        const clip = previewWindow(selected.moment, tickrate);
+        if (!clip) throw new Error("This clip has no ticks to preview.");
+        const { start, end } = clip;
         const mapName = row.payload?.map ?? row.map ?? "";
         const qualityNow = qualityRef.current;
         loadedMap.current = { clip: selected.id, quality: qualityNow };
