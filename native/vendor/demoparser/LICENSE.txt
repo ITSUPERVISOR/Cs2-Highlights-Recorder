@@ -1,0 +1,4 @@
+The parser and csgoproto sources under this directory are from
+https://github.com/LaihoE/demoparser (MIT License, Copyright LaihoE).
+Their build scripts are replaced with no-ops so the checked-in generated
+protobuf and maps are used as-is.
