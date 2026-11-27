@@ -61,7 +61,7 @@ export function LibraryPage({ onOpen }: { onOpen: (match: MatchRow) => void }) {
         setSettings((prev) => (prev ? { ...prev, askPlayerEveryTime: true } : prev));
       }
       const focused = await window.reel.choosePlayer(picker.id, steamid);
-      setMatches((prev) => prev.map((row) => (row.id === focused.id ? focused : row)));
+      rememberListRow(focused);
       setPicker(null);
       setSelected(null);
       onOpen(focused);
@@ -72,18 +72,35 @@ export function LibraryPage({ onOpen }: { onOpen: (match: MatchRow) => void }) {
     }
   }
 
+  async function openFull(match: MatchRow) {
+    if (match.payload?.rounds) return match;
+    const full = await window.reel.getMatch(match.id);
+    if (!full) throw new Error("That match is no longer in the library.");
+    return full as MatchRow;
+  }
+
+  function rememberListRow(match: MatchRow) {
+    const listed = { ...match, payload: null };
+    setMatches((prev) => prev.map((row) => (row.id === match.id ? listed : row)));
+  }
+
   async function openOrParse(match: MatchRow) {
     setError(null);
-    if (match.payload && match.payload.playerSteamid) {
-      onOpen(match);
+    const focusedId = match.summary?.playerSteamid ?? match.payload?.playerSteamid;
+    if (focusedId) {
+      try {
+        onOpen(await openFull(match));
+      } catch (err) {
+        setError(String(err));
+      }
       return;
     }
     let parsed = match;
-    if (!match.payload) {
+    if (!match.summary && !match.payload) {
       setBusy("Parsing demo…");
       try {
         parsed = await window.reel.analyze(match.id);
-        setMatches((prev) => prev.map((row) => (row.id === parsed.id ? parsed : row)));
+        rememberListRow(parsed);
       } catch (err) {
         setError(String(err));
         setBusy(null);
@@ -92,20 +109,21 @@ export function LibraryPage({ onOpen }: { onOpen: (match: MatchRow) => void }) {
         setBusy(null);
       }
     }
+    const full = await openFull(parsed);
     const prefs = settings ?? (await window.reel.getSettings());
-    const inDemo = parsed.payload?.players.some((player) => player.steamid === prefs.steamId);
+    const inDemo = full.payload?.players.some((player) => player.steamid === prefs.steamId);
     if (!prefs.askPlayerEveryTime && prefs.steamId && inDemo) {
-      const focused = await window.reel.choosePlayer(parsed.id, prefs.steamId);
-      setMatches((prev) => prev.map((row) => (row.id === focused.id ? focused : row)));
+      const focused = await window.reel.choosePlayer(full.id, prefs.steamId);
+      rememberListRow(focused);
       onOpen(focused);
       return;
     }
     const hint =
       (prefs.steamId && inDemo ? prefs.steamId : null) ??
-      parsed.payload?.players.find((player) => localIds.has(player.steamid))?.steamid ??
+      full.payload?.players.find((player) => localIds.has(player.steamid))?.steamid ??
       null;
     setSelected(hint);
-    setPicker(parsed);
+    setPicker(full);
   }
 
   return (
@@ -141,11 +159,12 @@ export function LibraryPage({ onOpen }: { onOpen: (match: MatchRow) => void }) {
           </div>
           <div className="divide-y divide-line">
             {matches.map((match) => {
-              const you = match.payload?.you;
-              const highlights = match.payload?.playerSteamid ? (match.payload.highlightCount ?? 0) : 0;
-              const scoreline = match.payload
-                ? `${match.payload.scoreline.ct} – ${match.payload.scoreline.t}`
-                : null;
+              const card = match.summary;
+              const you = card?.you ?? match.payload?.you;
+              const focused = Boolean(card?.playerSteamid ?? match.payload?.playerSteamid);
+              const highlights = focused ? (card?.highlightCount ?? match.payload?.highlightCount ?? 0) : 0;
+              const scoreline = card?.scoreline ?? match.payload?.scoreline;
+              const parsed = Boolean(card || match.payload);
               return (
                 <button
                   key={match.id}
@@ -158,11 +177,11 @@ export function LibraryPage({ onOpen }: { onOpen: (match: MatchRow) => void }) {
                       {formatMap(match.map)}
                     </div>
                     <div className="mt-0.5 text-xs text-muted">
-                      {scoreline ?? (match.payload ? "Pick a player" : "Click to parse")}
+                      {scoreline ? `${scoreline.ct} – ${scoreline.t}` : parsed ? "Pick a player" : "Click to parse"}
                     </div>
                   </div>
                   <div className="min-w-0 truncate text-sm font-medium">
-                    {you?.name ?? (match.payload ? "—" : <FileName path={match.demoPath} />)}
+                    {you?.name ?? (parsed ? "—" : <FileName path={match.demoPath} />)}
                   </div>
                   <div className="min-w-0 text-sm tabular-nums text-muted">
                     {you ? (

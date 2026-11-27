@@ -92,12 +92,21 @@ export type ParsePayload = {
   highlightCount: number;
 };
 
+export type MatchSummary = {
+  playerSteamid: string | null;
+  scoreline: { ct: number; t: number } | null;
+  highlightCount: number;
+  you: PlayerStats | null;
+};
+
 export type MatchRow = {
   id: string;
   demoPath: string;
   map: string | null;
   importedAt: number;
   status: string;
+  /** Score and your stats for the library list. The full parse stays on getMatch. */
+  summary: MatchSummary | null;
   payload: ParsePayload | null;
   recordedCount: number;
 };

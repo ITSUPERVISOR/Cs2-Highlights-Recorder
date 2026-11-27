@@ -19,9 +19,12 @@ export function StatsPage() {
     window.reel.listMatches().then(setMatches);
   }, []);
 
-  const reviewed = matches.filter((m) => m.payload?.you);
-  const yours = reviewed.map((m) => m.payload!.you!) as PlayerStats[];
-  const highlights = matches.reduce((n, m) => n + (m.payload?.highlightCount ?? 0), 0);
+  const reviewed = matches.filter((m) => m.summary?.you ?? m.payload?.you);
+  const yours = reviewed.map((m) => (m.summary?.you ?? m.payload!.you)!) as PlayerStats[];
+  const highlights = matches.reduce(
+    (n, m) => n + (m.summary?.highlightCount ?? m.payload?.highlightCount ?? 0),
+    0,
+  );
   const recorded = matches.reduce((n, m) => n + m.recordedCount, 0);
 
   const avgRating = avg(yours.map((p) => p.rating));
@@ -67,7 +70,7 @@ export function StatsPage() {
                 .slice()
                 .reverse()
                 .map((match) => {
-                  const player = match.payload!.you!;
+                  const player = (match.summary?.you ?? match.payload?.you)!;
                   const tone = ratingTone(player.rating);
                   return (
                     <div key={match.id} className="flex min-w-0 flex-1 flex-col items-center gap-2">
