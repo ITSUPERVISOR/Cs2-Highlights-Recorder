@@ -125,13 +125,138 @@ def _compute_tickrate(parser: DemoParser, sample_ticks: list[int]) -> float:
     return float(round(rate))
 
 
-def _build_rounds(parser: DemoParser, match_start_tick: int) -> list[Round]:
-    starts = _safe_event(parser, "round_start")
-    ends = _safe_event(parser, "round_end")
-    freeze_ends = _safe_event(parser, "round_freeze_end")
+# One pass covers every event the match summary needs. Separate calls rescan the file.
+MATCH_EVENTS = (
+    "begin_new_match",
+    "player_death",
+    "round_start",
+    "round_end",
+    "round_freeze_end",
+    "player_hurt",
+)
 
-    start_ticks = sorted(int(t) for t in starts.get("tick", pd.Series(dtype=int)))
-    freeze_ticks = sorted(int(t) for t in freeze_ends.get("tick", pd.Series(dtype=int)))
+
+def _match_event_kwargs(name: str) -> dict:
+    if name == "player_death":
+        return {"player": ["team_name"], "other": ["is_warmup_period"]}
+    if name == "player_hurt":
+        return {"other": ["is_warmup_period"]}
+    return {}
+
+
+def _load_match_events(parser: DemoParser) -> dict[str, pd.DataFrame]:
+    """Read the match events together, or one name at a time if a build cannot."""
+    parse_events = getattr(parser, "parse_events", None)
+    if parse_events is not None:
+        try:
+            pairs = parse_events(
+                list(MATCH_EVENTS),
+                player=["team_name"],
+                other=["is_warmup_period"],
+            )
+        except Exception:
+            pairs = None
+        loaded: dict[str, pd.DataFrame] = {}
+        for item in pairs or []:
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            name, frame = item
+            loaded[str(name)] = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        if "player_death" in loaded and "round_end" in loaded:
+            return {name: loaded.get(name, pd.DataFrame()) for name in MATCH_EVENTS}
+    return {
+        name: _safe_event(parser, name, **_match_event_kwargs(name))
+        for name in MATCH_EVENTS
+    }
+
+
+def _sample_player_rows(parser: DemoParser, ticks: list[int]) -> pd.DataFrame:
+    """Slots, side rosters, and tickrate share one tick read."""
+    unique = sorted({int(tick) for tick in ticks if int(tick) >= 0})
+    if not unique:
+        return pd.DataFrame()
+    try:
+        df = parser.parse_ticks(
+            ["is_alive", "team_num", "user_id", "game_time"],
+            ticks=unique,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    return df
+
+
+def _tickrate_from_rows(df: pd.DataFrame, t1: int, t2: int) -> float | None:
+    if df.empty or "game_time" not in df.columns or "tick" not in df.columns:
+        return None
+    subset = df[df["tick"].isin((t1, t2))]
+    if subset.empty:
+        return None
+    grouped = subset.groupby("tick")["game_time"].first()
+    if len(grouped) < 2:
+        return None
+    dt = grouped.index.max() - grouped.index.min()
+    elapsed = grouped.loc[grouped.index.max()] - grouped.loc[grouped.index.min()]
+    if elapsed <= 0:
+        return None
+    rate = dt / float(elapsed)
+    if not math.isfinite(rate) or rate < 16 or rate > 256:
+        return None
+    return float(round(rate))
+
+
+def _rosters_from_rows(df: pd.DataFrame, rounds: list[Round]) -> dict[int, dict[str, str]] | None:
+    if df.empty or "is_alive" not in df.columns or "team_num" not in df.columns or "tick" not in df.columns:
+        return None
+    sample_by_tick = {r.freeze_end_tick + 16: r.index for r in rounds}
+    if not sample_by_tick:
+        return {r.index: {} for r in rounds}
+    present = {int(tick) for tick in df["tick"].unique()}
+    if not present.intersection(sample_by_tick):
+        return None
+    rosters: dict[int, dict[str, str]] = {r.index: {} for r in rounds}
+    for row in df.to_dict("records"):
+        tick = int(row["tick"])
+        round_index = sample_by_tick.get(tick)
+        if round_index is None:
+            continue
+        if not bool(row.get("is_alive", False)):
+            continue
+        side = _normalize_side(row.get("team_num"))
+        if side not in ("CT", "T"):
+            continue
+        steamid = canonicalize_steamid(row.get("steamid", ""))
+        if steamid:
+            rosters[round_index][steamid] = side
+    return rosters
+
+
+def _slots_from_rows(df: pd.DataFrame, sample_tick: int) -> dict[str, int] | None:
+    if df.empty or "user_id" not in df.columns or "tick" not in df.columns:
+        return None
+    rows = [row for row in df.to_dict("records") if int(row["tick"]) == int(sample_tick)]
+    if not rows:
+        return None
+    slots: dict[str, int] = {}
+    for row in rows:
+        steamid = canonicalize_steamid(row.get("steamid", ""))
+        user_id = row.get("user_id")
+        if steamid and pd.notna(user_id):
+            slots[steamid] = int(user_id) + 1
+    return slots
+
+
+def _build_rounds(
+    starts: pd.DataFrame,
+    ends: pd.DataFrame,
+    freeze_ends: pd.DataFrame,
+    match_start_tick: int,
+) -> list[Round]:
+    start_ticks = sorted(int(t) for t in starts.get("tick", pd.Series(dtype=int))) if not starts.empty else []
+    freeze_ticks = (
+        sorted(int(t) for t in freeze_ends.get("tick", pd.Series(dtype=int))) if not freeze_ends.empty else []
+    )
 
     rounds: list[Round] = []
     if ends.empty:
@@ -203,22 +328,23 @@ def parse_demo(path: Path) -> DemoData:
         header = {}
     map_name = str(header.get("map_name", "unknown"))
 
-    new_match = _safe_event(parser, "begin_new_match")
+    events = _load_match_events(parser)
+    new_match = events["begin_new_match"]
     match_start_tick = 0
     if not new_match.empty and "tick" in new_match.columns:
         match_start_tick = int(new_match["tick"].max())
 
-    deaths_df = _safe_event(
-        parser,
-        "player_death",
-        player=["team_name"],
-        other=["is_warmup_period"],
-    )
+    deaths_df = events["player_death"]
     if deaths_df.empty:
         raise ValueError("No player_death events found — is this a valid CS2 demo?")
     deaths_df = deaths_df.sort_values("tick")
 
-    rounds = _build_rounds(parser, match_start_tick)
+    rounds = _build_rounds(
+        events["round_start"],
+        events["round_end"],
+        events["round_freeze_end"],
+        match_start_tick,
+    )
     if not rounds:
         raise ValueError("No round_end events found — demo looks incomplete")
     round_start_ticks = [r.start_tick for r in rounds]
@@ -280,15 +406,29 @@ def parse_demo(path: Path) -> DemoData:
         player_names.setdefault(kill.victim_steamid, kill.victim_name)
 
     death_ticks = [d.tick for d in deaths]
-    tickrate = _compute_tickrate(parser, death_ticks)
+    sample_ticks = [r.freeze_end_tick + 16 for r in rounds]
+    slot_tick = rounds[0].freeze_end_tick + 16
+    rate_ticks: list[int] = []
+    if len(death_ticks) >= 2:
+        t1, t2 = min(death_ticks), max(death_ticks)
+        if t2 - t1 >= 256:
+            rate_ticks = [t1, t2]
+    sampled = _sample_player_rows(parser, [*sample_ticks, slot_tick, *rate_ticks])
+    tickrate = _tickrate_from_rows(sampled, rate_ticks[0], rate_ticks[1]) if rate_ticks else None
+    if tickrate is None:
+        tickrate = _compute_tickrate(parser, death_ticks)
     last_tick = max(
         rounds[-1].end_tick,
         death_ticks[-1] if death_ticks else 0,
     ) + int(10 * tickrate)
 
-    rosters = _build_rosters(parser, rounds)
-    slots = get_slots(parser, rounds[0].freeze_end_tick + 16)
-    damage_by_player = _build_damage(parser, match_start_tick)
+    rosters = _rosters_from_rows(sampled, rounds)
+    if rosters is None:
+        rosters = _build_rosters(parser, rounds)
+    slots = _slots_from_rows(sampled, slot_tick)
+    if slots is None:
+        slots = get_slots(parser, slot_tick)
+    damage_by_player = _build_damage(events["player_hurt"], match_start_tick)
 
     return DemoData(
         path=path,
@@ -333,8 +473,7 @@ def _build_rosters(parser: DemoParser, rounds: list[Round]) -> dict[int, dict[st
     return rosters
 
 
-def _build_damage(parser: DemoParser, match_start_tick: int) -> dict[str, int]:
-    hurts = _safe_event(parser, "player_hurt", other=["is_warmup_period"])
+def _build_damage(hurts: pd.DataFrame, match_start_tick: int) -> dict[str, int]:
     totals: dict[str, int] = {}
     if hurts.empty:
         return totals

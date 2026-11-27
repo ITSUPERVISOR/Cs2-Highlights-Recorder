@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 from pathlib import Path
 
 import pandas as pd
@@ -89,7 +90,13 @@ class _EventSource:
         self._parser = parser
         self._events: dict[str, pd.DataFrame] | None = None
 
-    def load(self, names: tuple[str, ...] | list[str]) -> None:
+    def load(self, names: tuple[str, ...] | list[str], demo_path: Path | None = None) -> None:
+        cache = _event_cache_path(demo_path, names)
+        if cache is not None and cache.is_file():
+            loaded = _read_event_cache(cache)
+            if loaded is not None:
+                self._events = loaded
+                return
         parse_events = getattr(self._parser, "parse_events", None)
         if parse_events is None:
             return
@@ -106,7 +113,11 @@ class _EventSource:
                     continue
                 name, frame = item
                 loaded[str(name)] = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+            for name in names:
+                loaded.setdefault(str(name), pd.DataFrame())
             self._events = loaded
+            if cache is not None:
+                _write_event_cache(cache, loaded)
             return
 
     def event(self, name: str, **kwargs) -> pd.DataFrame:
@@ -123,6 +134,38 @@ class _EventSource:
 
     def __getattr__(self, name: str):
         return getattr(self._parser, name)
+
+
+def _event_cache_path(demo_path: Path | None, names: tuple[str, ...] | list[str]) -> Path | None:
+    """Clip events are the same for every window, so the scan is saved per demo."""
+    if demo_path is None or tuple(names) != CLIP_EVENTS:
+        return None
+    try:
+        stat = demo_path.stat()
+    except OSError:
+        return None
+    raw = f"{demo_path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|clip-events|v1"
+    key = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+    return preview_cache_dir() / f"events-{key}.pkl"
+
+
+def _read_event_cache(path: Path) -> dict[str, pd.DataFrame] | None:
+    try:
+        loaded = pickle.loads(path.read_bytes())
+    except Exception:
+        return None
+    if not isinstance(loaded, dict) or any(name not in loaded for name in CLIP_EVENTS):
+        return None
+    if any(not isinstance(frame, pd.DataFrame) for frame in loaded.values()):
+        return None
+    return loaded
+
+
+def _write_event_cache(path: Path, loaded: dict[str, pd.DataFrame]) -> None:
+    try:
+        path.write_bytes(pickle.dumps(loaded, protocol=pickle.HIGHEST_PROTOCOL))
+    except Exception:
+        pass
 
 
 def _event(parser: DemoParser, name: str, **kwargs) -> pd.DataFrame:
@@ -630,26 +673,106 @@ def _nade_kind(raw: str) -> str:
     return "other"
 
 
+# Thrown grenades only need a flight path when one of these already-loaded events
+# lands near the clip. Otherwise parse_grenades would rescan the whole demo.
+_FLIGHT_EVENTS = (
+    "weapon_fire",
+    "hegrenade_detonate",
+    "flashbang_detonate",
+    "smokegrenade_detonate",
+    "inferno_startburn",
+)
+_PROJECTILE_COLUMNS = ["tick", "x", "y", "z", "grenade_type", "grenade_entity_id"]
+
+
+def _grenade_cache_path(demo_path: Path) -> Path | None:
+    try:
+        stat = demo_path.stat()
+    except OSError:
+        return None
+    raw = f"{demo_path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|grenade-flights|v1"
+    key = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+    return preview_cache_dir() / f"grenades-{key}.parquet"
+
+
+def _clip_needs_grenade_flights(parser: DemoParser, start_tick: int, end_tick: int) -> bool:
+    """False when this clip's events are already loaded and none are grenades.
+
+    A parser that has not loaded events yet still needs the flight scan. Guessing
+    from a partial event set would hide a grenade that is in the air.
+    """
+    loaded = getattr(parser, "_events", None)
+    if not isinstance(loaded, dict) or any(name not in loaded for name in _FLIGHT_EVENTS):
+        return True
+    floor = int(start_tick) - int(4 * DEFAULT_TICKRATE)
+    ceiling = int(end_tick) + int(2 * DEFAULT_TICKRATE)
+    fires = loaded["weapon_fire"]
+    if isinstance(fires, pd.DataFrame) and not fires.empty and {"tick", "weapon"}.issubset(fires.columns):
+        window = fires[(fires["tick"] >= floor) & (fires["tick"] <= ceiling)]
+        if not window.empty and window["weapon"].astype(str).map(_is_grenade_weapon).any():
+            return True
+    for name in _FLIGHT_EVENTS[1:]:
+        frame = loaded[name]
+        if not isinstance(frame, pd.DataFrame) or frame.empty or "tick" not in frame.columns:
+            continue
+        ticks = frame["tick"]
+        if ((ticks >= floor) & (ticks <= ceiling)).any():
+            return True
+    return False
+
+
+def _projectile_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Airborne projectiles only. Inventory rows have no position."""
+    if df is None or df.empty or not set(_PROJECTILE_COLUMNS).issubset(df.columns):
+        return pd.DataFrame(columns=_PROJECTILE_COLUMNS)
+    kinds = df["grenade_type"].astype(str)
+    kept = df.loc[kinds.str.endswith("Projectile"), _PROJECTILE_COLUMNS]
+    return kept.dropna(subset=["x", "y", "z", "grenade_entity_id"])
+
+
+def _load_projectile_rows(parser: DemoParser, demo_path: Path | None) -> pd.DataFrame:
+    """Grenade flights for the whole demo, reused by later clips of the same file."""
+    cache = _grenade_cache_path(demo_path) if demo_path is not None else None
+    if cache is not None and cache.is_file():
+        try:
+            cached = pd.read_parquet(cache)
+        except Exception:
+            cached = None
+        if isinstance(cached, pd.DataFrame):
+            return cached
+    try:
+        raw = parser.parse_grenades()
+    except Exception:
+        return pd.DataFrame(columns=_PROJECTILE_COLUMNS)
+    table = _projectile_rows(raw if isinstance(raw, pd.DataFrame) else pd.DataFrame())
+    if cache is not None:
+        try:
+            table.to_parquet(cache, index=False)
+        except Exception:
+            pass
+    return table
+
+
 def _grenades_in_window(
-    parser: DemoParser, start_tick: int, end_tick: int, stride: int
+    parser: DemoParser,
+    start_tick: int,
+    end_tick: int,
+    stride: int,
+    demo_path: Path | None = None,
 ) -> list[dict]:
     """Flight paths of airborne grenades, one entry per projectile entity.
 
     `parse_grenades` reports both the inventory item (`CFlashbang`) and the
     thrown projectile (`CFlashbangProjectile`). Only the latter is in flight; the
-    item rows carry NaN positions.
+    item rows carry NaN positions. The projectile table is cached per demo because
+    reading it scans the whole file.
     """
-    try:
-        df = parser.parse_grenades()
-    except Exception:
+    if not _clip_needs_grenade_flights(parser, start_tick, end_tick):
         return []
-    if df is None or df.empty:
-        return []
-    needed = {"tick", "x", "y", "z", "grenade_type", "grenade_entity_id"}
-    if not needed.issubset(set(df.columns)):
+    df = _load_projectile_rows(parser, demo_path)
+    if df.empty or not set(_PROJECTILE_COLUMNS).issubset(df.columns):
         return []
     df = df[(df["tick"] >= start_tick) & (df["tick"] <= end_tick)]
-    df = df.dropna(subset=["x", "y", "z", "grenade_entity_id"])
     if df.empty:
         return []
     kinds = df["grenade_type"].astype(str)
@@ -919,7 +1042,7 @@ def dump_clip_trajectory(
 
     ticks = list(range(int(start_tick), int(end_tick) + 1, max(1, stride)))
     parser = _EventSource(DemoParser(str(dem)))
-    parser.load(CLIP_EVENTS)
+    parser.load(CLIP_EVENTS, dem)
     header = {}
     try:
         header = parser.parse_header() or {}
@@ -933,7 +1056,7 @@ def dump_clip_trajectory(
     # Everything below is optional colour: a demo without it still replays.
     shots = _shots_in_window(parser, int(start_tick), int(end_tick))
     _mark_punch_impulses(frames, shots)
-    grenades = _grenades_in_window(parser, int(start_tick), int(end_tick), stride)
+    grenades = _grenades_in_window(parser, int(start_tick), int(end_tick), stride, dem)
     smokes = _timed_volumes(
         parser, "smokegrenade_detonate", "smokegrenade_expired", int(start_tick), int(end_tick)
     )
