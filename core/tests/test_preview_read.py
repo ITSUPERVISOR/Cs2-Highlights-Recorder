@@ -70,7 +70,43 @@ def test_events_are_read_once_and_reused():
     assert parser.passes == 1
 
 
-def test_events_fall_back_to_one_name_at_a_time():
+def test_frames_group_players_without_iterrows():
+    frame = trajectory.frames_from_dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "tick": 200,
+                    "steamid": ALICE,
+                    "X": 4,
+                    "Y": 5,
+                    "Z": 6,
+                    "pitch": 1,
+                    "yaw": 2,
+                    "is_alive": True,
+                    "health": 80,
+                    "team_num": 2,
+                    "weapon_name": "ak47",
+                    "name": "Alice",
+                },
+                {
+                    "tick": 100,
+                    "steamid": ALICE,
+                    "X": 1,
+                    "Y": 2,
+                    "Z": 3,
+                    "is_alive": True,
+                    "team_num": 3,
+                    "active_weapon_name": "glock",
+                    "name": "Alice",
+                },
+            ]
+        )
+    )
+    assert [item["tick"] for item in frame] == [100, 200]
+    assert frame[0]["players"][ALICE]["weapon"] == "glock"
+    assert frame[0]["players"][ALICE]["team"] == "CT"
+    assert frame[1]["players"][ALICE]["weapon"] == "ak47"
+    assert frame[1]["players"][ALICE]["health"] == 80
     parser = _EventParser(fail=True)
     source = trajectory._EventSource(parser)
     source.load(CLIP_EVENTS)

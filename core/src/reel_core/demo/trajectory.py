@@ -147,12 +147,28 @@ def cache_key(demo_path: Path, start_tick: int, end_tick: int, pov: str, stride:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
 
-def _num(row: pd.Series, *names: str, default: float = 0.0) -> float:
+_MISSING = object()
+
+
+def _cell(row: pd.Series | dict, name: str):
+    if isinstance(row, dict):
+        if name not in row:
+            return _MISSING
+        return row[name]
+    if name not in row.index:
+        return _MISSING
+    return row[name]
+
+
+def _num(row: pd.Series | dict, *names: str, default: float = 0.0) -> float:
     for name in names:
-        if name not in row.index:
+        value = _cell(row, name)
+        if value is _MISSING:
             continue
-        value = row[name]
-        if pd.isna(value):
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
             continue
         try:
             return float(value)
@@ -161,12 +177,15 @@ def _num(row: pd.Series, *names: str, default: float = 0.0) -> float:
     return default
 
 
-def _bool(row: pd.Series, *names: str, default: bool = True) -> bool:
+def _bool(row: pd.Series | dict, *names: str, default: bool = True) -> bool:
     for name in names:
-        if name not in row.index:
+        value = _cell(row, name)
+        if value is _MISSING:
             continue
-        value = row[name]
-        if pd.isna(value):
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
             continue
         if isinstance(value, str):
             return value.lower() not in ("0", "false", "no")
@@ -174,12 +193,15 @@ def _bool(row: pd.Series, *names: str, default: bool = True) -> bool:
     return default
 
 
-def _str(row: pd.Series, *names: str) -> str:
+def _str(row: pd.Series | dict, *names: str) -> str:
     for name in names:
-        if name not in row.index:
+        value = _cell(row, name)
+        if value is _MISSING:
             continue
-        value = row[name]
-        if pd.isna(value):
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
             continue
         text = str(value).strip()
         if text and text.lower() != "nan":
@@ -187,12 +209,10 @@ def _str(row: pd.Series, *names: str) -> str:
     return ""
 
 
-def _vec(row: pd.Series, name: str, index: int, default: float = 0.0) -> float:
+def _vec(row: pd.Series | dict, name: str, index: int, default: float = 0.0) -> float:
     """One component of a QAngle/Vector prop, which arrives as a 3-element list."""
-    if name not in row.index:
-        return default
-    value = row[name]
-    if not isinstance(value, (list, tuple)) or len(value) <= index:
+    value = _cell(row, name)
+    if value is _MISSING or not isinstance(value, (list, tuple)) or len(value) <= index:
         return default
     item = value[index]
     try:
@@ -201,6 +221,25 @@ def _vec(row: pd.Series, name: str, index: int, default: float = 0.0) -> float:
         return float(item)
     except (TypeError, ValueError):
         return default
+
+
+def _records(df: pd.DataFrame) -> list[dict]:
+    """Row dicts. Much cheaper than DataFrame.iterrows on a clip's poses."""
+    if df is None or df.empty:
+        return []
+    return df.to_dict("records")
+
+
+def _records_between(df: pd.DataFrame, floor: int, end: int) -> list[dict]:
+    """Rows whose tick is inside the clip, without walking the rest of the match."""
+    if df is None or df.empty or "tick" not in df.columns:
+        return []
+    window = df[(df["tick"] >= floor) & (df["tick"] <= end)]
+    if window.empty:
+        return []
+    if not window["tick"].is_monotonic_increasing:
+        window = window.sort_values("tick")
+    return window.to_dict("records")
 
 
 def _team(row: pd.Series) -> str:
@@ -285,46 +324,58 @@ def frames_from_dataframe(df: pd.DataFrame) -> list[dict]:
     frames: list[dict] = []
     if df.empty or "tick" not in df.columns:
         return frames
-    for tick, group in df.groupby("tick", sort=True):
-        players: dict[str, dict] = {}
-        for _, row in group.iterrows():
-            steamid = canonicalize_steamid(row.get("steamid", ""))
-            if not steamid:
-                continue
-            alive = _bool(row, "is_alive", default=True)
-            health = _num(row, "health", default=100.0)
-            if health <= 0:
-                alive = False
-            duck_amount = _num(row, "CCSPlayerPawn.CCSPlayer_MovementServices.m_flDuckAmount", default=-1.0)
-            ducking = _bool(row, "ducking", "is_ducking", default=False)
-            if duck_amount < 0:
-                # No duck amount in this demo: fall back to the boolean.
-                duck_amount = 1.0 if ducking else 0.0
-            players[steamid] = {
-                "x": round(_num(row, "X"), 2),
-                "y": round(_num(row, "Y"), 2),
-                "z": round(_num(row, "Z"), 2),
-                "pitch": round(_num(row, "pitch"), 2),
-                "yaw": round(_num(row, "yaw"), 2),
-                "alive": alive,
-                "ducking": ducking,
-                "weapon": _str(row, "active_weapon_name", "weapon_name"),
-                "team": _team(row),
-                "name": _str(row, "name"),
-                # Extras. Absent props collapse to harmless defaults.
-                "health": round(health),
-                "armor": round(_num(row, "CCSPlayerPawn.m_ArmorValue", default=0.0)),
-                "duck": round(min(1.0, max(0.0, duck_amount)), 3),
-                "punchPitch": round(_vec(row, PUNCH_FIELD, 0), 3),
-                "punchYaw": round(_vec(row, PUNCH_FIELD, 1), 3),
-                "scoped": _bool(row, "CCSPlayerPawn.m_bIsScoped", default=False),
-                "walking": _bool(row, "CCSPlayerPawn.m_bIsWalking", default=False),
-                "place": _str(row, "CCSPlayerPawn.m_szLastPlaceName"),
-                "skin": _str(row, "active_weapon_skin"),
-                "paintKit": int(_num(row, "fall_back_paint_kit", default=0.0)),
-            }
-        if players:
-            frames.append({"tick": int(tick), "players": players})
+    ordered = df if df["tick"].is_monotonic_increasing else df.sort_values("tick")
+    current: int | None = None
+    players: dict[str, dict] = {}
+    for row in ordered.to_dict("records"):
+        try:
+            tick = int(row.get("tick"))
+        except (TypeError, ValueError):
+            continue
+        if current is None:
+            current = tick
+        elif tick != current:
+            if players:
+                frames.append({"tick": current, "players": players})
+            players = {}
+            current = tick
+        steamid = canonicalize_steamid(row.get("steamid", ""))
+        if not steamid:
+            continue
+        alive = _bool(row, "is_alive", default=True)
+        health = _num(row, "health", default=100.0)
+        if health <= 0:
+            alive = False
+        duck_amount = _num(row, "CCSPlayerPawn.CCSPlayer_MovementServices.m_flDuckAmount", default=-1.0)
+        ducking = _bool(row, "ducking", "is_ducking", default=False)
+        if duck_amount < 0:
+            # No duck amount in this demo: fall back to the boolean.
+            duck_amount = 1.0 if ducking else 0.0
+        players[steamid] = {
+            "x": round(_num(row, "X"), 2),
+            "y": round(_num(row, "Y"), 2),
+            "z": round(_num(row, "Z"), 2),
+            "pitch": round(_num(row, "pitch"), 2),
+            "yaw": round(_num(row, "yaw"), 2),
+            "alive": alive,
+            "ducking": ducking,
+            "weapon": _str(row, "active_weapon_name", "weapon_name"),
+            "team": _team(row),
+            "name": _str(row, "name"),
+            # Extras. Absent props collapse to harmless defaults.
+            "health": round(health),
+            "armor": round(_num(row, "CCSPlayerPawn.m_ArmorValue", default=0.0)),
+            "duck": round(min(1.0, max(0.0, duck_amount)), 3),
+            "punchPitch": round(_vec(row, PUNCH_FIELD, 0), 3),
+            "punchYaw": round(_vec(row, PUNCH_FIELD, 1), 3),
+            "scoped": _bool(row, "CCSPlayerPawn.m_bIsScoped", default=False),
+            "walking": _bool(row, "CCSPlayerPawn.m_bIsWalking", default=False),
+            "place": _str(row, "CCSPlayerPawn.m_szLastPlaceName"),
+            "skin": _str(row, "active_weapon_skin"),
+            "paintKit": int(_num(row, "fall_back_paint_kit", default=0.0)),
+        }
+    if current is not None and players:
+        frames.append({"tick": current, "players": players})
     return frames
 
 
@@ -366,10 +417,10 @@ def _mark_punch_impulses(frames: list[dict], shots: list[dict]) -> None:
 
 def _index_by_shooter(df: pd.DataFrame, id_col: str) -> dict[tuple[str, int], pd.Series]:
     """Index event rows by (steamid, tick) for joining onto fire_bullets."""
-    index: dict[tuple[str, int], pd.Series] = {}
+    index: dict[tuple[str, int], dict | pd.Series] = {}
     if df.empty or "tick" not in df.columns or id_col not in df.columns:
         return index
-    for _, row in df.iterrows():
+    for row in _records(df):
         steamid = canonicalize_steamid(_str(row, id_col))
         if not steamid:
             continue
@@ -382,8 +433,8 @@ def _index_by_shooter(df: pd.DataFrame, id_col: str) -> dict[tuple[str, int], pd
 
 
 def _nearest_event(
-    index: dict[tuple[str, int], pd.Series], steamid: str, tick: int
-) -> pd.Series | None:
+    index: dict[tuple[str, int], dict | pd.Series], steamid: str, tick: int
+) -> dict | pd.Series | None:
     """Same shot, allowing a tick of slack between the paired events."""
     for offset in (0, -1, 1):
         row = index.get((steamid, tick + offset))
@@ -412,7 +463,7 @@ def _shots_in_window(parser: DemoParser, start_tick: int, end_tick: int) -> list
     hurts = _index_by_shooter(_event(parser, "player_hurt"), "attacker_steamid")
 
     shots: list[dict] = []
-    for _, row in window.iterrows():
+    for row in _records(window):
         steamid = canonicalize_steamid(_str(row, "user_steamid"))
         if not steamid:
             continue
@@ -474,12 +525,10 @@ def _throws_in_window(
         return []
     floor = int(start_tick) - max(0, int(lookback_ticks))
     out: list[dict] = []
-    for _, row in df.sort_values("tick").iterrows():
+    for row in _records_between(df, floor, end_tick):
         try:
             tick = int(row["tick"])
         except (TypeError, ValueError):
-            continue
-        if tick < floor or tick > end_tick:
             continue
         weapon = _str(row, "weapon")
         if not _is_grenade_weapon(weapon):
@@ -507,12 +556,10 @@ def _blinds_in_window(
         return []
     rate = max(float(tickrate), 1.0)
     out: list[dict] = []
-    for _, row in df.sort_values("tick").iterrows():
+    for row in _records_between(df, df["tick"].min(), end_tick):
         try:
             tick = int(row["tick"])
         except (TypeError, ValueError):
-            continue
-        if tick > end_tick:
             continue
         duration = _num(row, "blind_duration", default=0.0)
         if duration <= 0:
@@ -549,12 +596,10 @@ def _player_events(
         return []
     floor = int(start_tick) - max(0, int(lookback_ticks))
     out: list[dict] = []
-    for _, row in df.sort_values("tick").iterrows():
+    for row in _records_between(df, floor, end_tick):
         try:
             tick = int(row["tick"])
         except (TypeError, ValueError):
-            continue
-        if tick < floor or tick > end_tick:
             continue
         steamid = canonicalize_steamid(_str(row, "user_steamid"))
         if not steamid:
@@ -616,6 +661,7 @@ def _grenades_in_window(
     out: list[dict] = []
     for entity, group in df.groupby("grenade_entity_id", sort=True):
         group = group.sort_values("tick")
+        rows = group.sort_values("tick").to_dict("records")
         points = [
             {
                 "tick": int(row["tick"]),
@@ -623,8 +669,8 @@ def _grenades_in_window(
                 "y": round(float(row["y"]), 1),
                 "z": round(float(row["z"]), 1),
             }
-            for i, (_, row) in enumerate(group.iterrows())
-            if i % step == 0 or i == len(group) - 1
+            for i, row in enumerate(rows)
+            if i % step == 0 or i == len(rows) - 1
         ]
         if len(points) < 2:
             continue
@@ -662,17 +708,15 @@ def _timed_volumes(
 
     expiry: dict[int, list[int]] = {}
     if not ends.empty and "entityid" in ends.columns:
-        for _, row in ends.sort_values("tick").iterrows():
+        for row in _records(ends.sort_values("tick")):
             try:
                 expiry.setdefault(int(row["entityid"]), []).append(int(row["tick"]))
             except (TypeError, ValueError):
                 continue
 
     out: list[dict] = []
-    for _, row in starts.sort_values("tick").iterrows():
+    for row in _records_between(starts, int(starts["tick"].min()), end_tick):
         tick = int(row["tick"])
-        if tick > end_tick:
-            continue
         entity = None
         if "entityid" in starts.columns:
             try:
@@ -740,7 +784,7 @@ def _bomb_starts(parser: DemoParser, name: str) -> list[dict]:
     if df.empty or "tick" not in df.columns:
         return []
     out: list[dict] = []
-    for _, row in df.sort_values("tick").iterrows():
+    for row in _records(df):
         try:
             tick = int(row["tick"])
         except (TypeError, ValueError):
@@ -825,7 +869,7 @@ def _bursts(parser: DemoParser, start_tick: int, end_tick: int) -> list[dict]:
         if df.empty:
             continue
         window = df[(df["tick"] >= start_tick) & (df["tick"] <= end_tick)]
-        for _, row in window.sort_values("tick").iterrows():
+        for row in _records(window):
             out.append(
                 {
                     "kind": kind,
