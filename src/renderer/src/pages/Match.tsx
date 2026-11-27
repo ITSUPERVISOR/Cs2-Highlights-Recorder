@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { KillFeed } from "../components/KillFeed";
 import { PlayerPicker } from "../components/PlayerPicker";
-import type { MatchRow, Moment, PlayerStats, ReelSettings } from "../lib/types";
+import type { MatchRow, Moment, PlayerStats, QueueItem, ReelSettings } from "../lib/types";
 import { Badge, Metric, Stat, formatMap } from "../components/ui";
 import { adrTone, kdTone, ratingTone, toneClass } from "../lib/statColors";
 
@@ -24,8 +24,15 @@ export function MatchPage({
   const [selected, setSelected] = useState<string | null>(payload?.playerSteamid ?? null);
   const [localIds, setLocalIds] = useState<Set<string>>(new Set());
   const [settings, setSettings] = useState<ReelSettings | null>(null);
+  const [queuedIds, setQueuedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
+    window.reel
+      .listQueue()
+      .then((items: QueueItem[]) => {
+        setQueuedIds(new Set(items.filter((item) => item.matchId === match.id).map((item) => item.moment.id)));
+      })
+      .catch(() => undefined);
     window.reel.getSettings().then(setSettings).catch(() => undefined);
     window.reel
       .detectSteamid()
@@ -33,7 +40,7 @@ export function MatchPage({
         setLocalIds(new Set((report.accounts ?? []).map((account) => account.steamid)));
       })
       .catch(() => undefined);
-  }, []);
+  }, [match.id]);
 
   if (!payload) {
     return (
@@ -77,7 +84,9 @@ export function MatchPage({
   }
 
   async function queueMoment(moment: Moment) {
+    if (queuedIds.has(moment.id)) return;
     await window.reel.addToQueue(match.id, moment);
+    setQueuedIds((prev) => new Set(prev).add(moment.id));
     onQueued();
   }
 
@@ -201,6 +210,7 @@ export function MatchPage({
                     <ClipRow
                       key={moment.id}
                       moment={moment}
+                      queued={queuedIds.has(moment.id)}
                       onWatch={() => watchMoment(moment)}
                       onQueue={() => queueMoment(moment)}
                     />
@@ -283,10 +293,12 @@ function ScoreboardSide({
 
 function ClipRow({
   moment,
+  queued,
   onWatch,
   onQueue,
 }: {
   moment: Moment;
+  queued: boolean;
   onWatch: () => void;
   onQueue: () => void;
 }) {
@@ -317,10 +329,12 @@ function ClipRow({
           Watch
         </button>
         <button
+          type="button"
           onClick={onQueue}
-          className="rounded-full bg-amber px-3.5 py-1.5 text-sm font-semibold text-ink"
+          disabled={queued}
+          className="rounded-full bg-amber px-3.5 py-1.5 text-sm font-semibold text-ink disabled:cursor-default disabled:bg-raised disabled:text-muted"
         >
-          Queue
+          {queued ? "Queued" : "Queue"}
         </button>
       </div>
     </article>

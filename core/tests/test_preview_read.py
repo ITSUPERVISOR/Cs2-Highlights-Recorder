@@ -196,6 +196,35 @@ def test_grenade_flights_are_reused_for_the_same_demo(tmp_path, monkeypatch):
     assert second == first
 
 
+def test_warm_preview_scans_a_demo_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(trajectory, "preview_cache_dir", lambda: tmp_path)
+    demo = tmp_path / "match.dem"
+    demo.write_bytes(b"demo")
+    calls = {"events": 0, "grenades": 0}
+
+    class Parser:
+        def __init__(self, _path: str):
+            pass
+
+        def parse_events(self, names, **_kwargs):
+            calls["events"] += 1
+            return [
+                (name, pd.DataFrame([{"tick": 1, "weapon": "ak47", "user_steamid": ALICE}]))
+                for name in names
+            ]
+
+        def parse_grenades(self):
+            calls["grenades"] += 1
+            return pd.DataFrame(columns=["tick", "x", "y", "z", "grenade_type", "grenade_entity_id"])
+
+    monkeypatch.setattr(trajectory, "DemoParser", Parser)
+    first = trajectory.warm_preview_caches(demo)
+    second = trajectory.warm_preview_caches(demo)
+    assert first == {"ok": True, "events": True, "grenades": 0}
+    assert second == first
+    assert calls == {"events": 1, "grenades": 1}
+
+
 def test_clip_events_are_reused_for_the_same_demo(tmp_path, monkeypatch):
     monkeypatch.setattr(trajectory, "preview_cache_dir", lambda: tmp_path)
     demo = tmp_path / "match.dem"

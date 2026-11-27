@@ -494,6 +494,7 @@ app.whenReady().then(async () => {
       id,
     ]);
     persistDb();
+    scheduleDemoWarm(match.demoPath);
     return getMatch(id);
   });
 
@@ -796,6 +797,15 @@ function listQueue() {
 }
 
 let previewWarm: Promise<unknown> = Promise.resolve();
+
+function scheduleDemoWarm(demoPath: string) {
+  if (!demoPath) return;
+  // Shared by every clip of this demo. A queued clip waits its turn behind this,
+  // so the two scans do not run twice.
+  previewWarm = previewWarm
+    .catch(() => undefined)
+    .then(() => runCore(["warm-preview", demoPath, "--json"], 300_000).catch(() => undefined));
+}
 
 function schedulePreviewWarm(matchId: string, moment: unknown) {
   if (!moment || typeof moment !== "object") return;
