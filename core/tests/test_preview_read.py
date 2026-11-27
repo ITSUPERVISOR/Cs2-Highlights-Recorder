@@ -3,21 +3,27 @@
 import pandas as pd
 
 from reel_core.demo import trajectory
-from reel_core.demo.trajectory import CLIP_EVENTS, PUNCH_FIELD
+from reel_core.demo.trajectory import CLIP_EVENTS, DUCK_AMOUNT, PUNCH_FIELD
 
 ALICE = "76561198000000001"
 
 
 class _TickParser:
-    def __init__(self, fail_combined: bool = False):
+    def __init__(self, fail_combined: bool = False, duck_amount: bool = True):
         self.calls: list[list[str]] = []
         self.fail_combined = fail_combined
+        self.duck_amount = duck_amount
 
     def parse_ticks(self, fields, ticks=None):
         self.calls.append(list(fields))
         if self.fail_combined and PUNCH_FIELD in fields:
             raise RuntimeError("prop missing")
-        return pd.DataFrame({"tick": [1], "steamid": [ALICE], "X": [1.0]})
+        row = {"tick": 1, "steamid": ALICE, "X": 1.0}
+        if self.duck_amount and fields == ["ducking"]:
+            row["ducking"] = True
+        elif self.duck_amount:
+            row[DUCK_AMOUNT] = 0.0
+        return pd.DataFrame([row])
 
 
 class _EventParser:
@@ -49,6 +55,34 @@ def test_clip_ticks_are_one_read_when_every_prop_exists():
     frame = trajectory._parse_clip_ticks(parser, [1])
     assert list(frame["X"]) == [1.0]
     assert parser.calls == [list(dict.fromkeys([*trajectory.POSE_FIELDS, *trajectory.EXTRA_FIELDS]))]
+
+
+def test_missing_duck_amount_reads_the_boolean_once():
+    parser = _TickParser(duck_amount=False)
+    trajectory._parse_clip_ticks(parser, [1])
+    assert parser.calls[0] == list(dict.fromkeys([*trajectory.POSE_FIELDS, *trajectory.EXTRA_FIELDS]))
+    assert "ducking" not in parser.calls[0]
+    assert parser.calls[1] == ["ducking"]
+
+
+def test_duck_amount_marks_a_crouch_without_the_boolean():
+    frames = trajectory.frames_from_dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "tick": 1,
+                    "steamid": ALICE,
+                    "X": 0,
+                    "Y": 0,
+                    "Z": 0,
+                    DUCK_AMOUNT: 1,
+                }
+            ]
+        )
+    )
+    pose = frames[0]["players"][ALICE]
+    assert pose["duck"] == 1
+    assert pose["ducking"] is True
 
 
 def test_clip_ticks_fall_back_when_the_combined_read_fails():
