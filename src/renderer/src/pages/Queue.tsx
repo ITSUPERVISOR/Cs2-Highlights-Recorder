@@ -7,6 +7,7 @@ export function QueuePage() {
   const [items, setItems] = useState<QueueItem[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
+  const [failures, setFailures] = useState<{ demoPath: string; error: string }[]>([]);
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
 
   async function refresh() {
@@ -38,9 +39,25 @@ export function QueuePage() {
         : "Recording via HLAE — keep CS2 focused and visible. This takes roughly real time.",
     );
     setResult(null);
+    setFailures([]);
     try {
-      const payload = await window.reel.recordQueue();
-      setResult(`Wrote ${payload.clips.length} clip(s) to ${payload.outDir}`);
+      const payload = (await window.reel.recordQueue()) as {
+        clips: string[];
+        outDir: string;
+        failures?: { demoPath: string; error: string }[];
+      };
+      const failed = payload.failures ?? [];
+      const wrote = payload.clips?.length ?? 0;
+      if (wrote && failed.length === 0) {
+        setResult(`Wrote ${wrote} clip(s) to ${payload.outDir}`);
+      } else if (wrote) {
+        setResult(
+          `Wrote ${wrote} clip(s) to ${payload.outDir}. ${failed.length} match${failed.length === 1 ? "" : "es"} stayed in the queue.`,
+        );
+      } else {
+        setResult("No clips were written. The queue is unchanged.");
+      }
+      setFailures(failed);
       await refresh();
     } catch (err) {
       setResult(String(err));
@@ -129,6 +146,16 @@ export function QueuePage() {
       )}
       {busy && <p className="text-sm text-amber">{busy}</p>}
       {result && <p className="text-sm text-muted">{result}</p>}
+      {failures.length > 0 && (
+        <ul className="space-y-1 text-sm text-danger">
+          {failures.map((failure) => (
+            <li key={`${failure.demoPath}:${failure.error}`}>
+              <span className="font-medium">{failure.demoPath.split(/[/\\]/).pop()}</span>
+              {` — ${failure.error}`}
+            </li>
+          ))}
+        </ul>
+      )}
       <div className="grid gap-2">
         {items.length === 0 && (
           <div className="rounded-xl border border-dashed border-line px-8 py-14 text-center text-muted">
