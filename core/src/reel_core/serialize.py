@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from reel_core.demo.parser import DemoData
-from reel_core.models import Moment, PlayerStats, Sequence
+from reel_core.models import CameraAction, Moment, PlayerStats, Sequence
 
 
 def kill_to_dict(kill) -> dict:
@@ -128,6 +128,8 @@ def parse_payload(
         "moments": [moment_to_dict(m, demo.tickrate) for m in moments],
         "sequences": [sequence_to_dict(s, demo.tickrate) for s in sequences],
         "highlightCount": len(moments),
+        # spec_player slots, so Record can aim the camera without parsing the demo again.
+        "slots": {steamid: int(slot) for steamid, slot in demo.slots.items()},
     }
 
 
@@ -142,3 +144,106 @@ def load_moments_file(path: Path) -> list[dict]:
     if "sequences" in data:
         return data["sequences"]
     raise ValueError(f"No moments/sequences found in {path}")
+
+
+def library_demo(demo_path: Path, library: dict) -> DemoData | None:
+    """A DemoData built from a saved library payload.
+
+    Record only needs the demo path, tickrate, player names, and spec slots.
+    Returning None means the payload is from before slots were stored, and the
+    caller should parse the demo.
+    """
+    raw_slots = library.get("slots")
+    if not isinstance(raw_slots, dict) or not raw_slots:
+        return None
+    slots: dict[str, int] = {}
+    for key, value in raw_slots.items():
+        try:
+            slot = int(value)
+        except (TypeError, ValueError):
+            continue
+        steamid = str(key)
+        if steamid and slot > 0:
+            slots[steamid] = slot
+    if not slots:
+        return None
+    names: dict[str, str] = {}
+    players = library.get("players")
+    if isinstance(players, list):
+        for player in players:
+            if isinstance(player, dict) and player.get("steamid"):
+                names[str(player["steamid"])] = str(player.get("name") or "")
+    try:
+        tickrate = float(library.get("tickrate") or 64)
+    except (TypeError, ValueError):
+        tickrate = 64.0
+    if tickrate <= 0:
+        tickrate = 64.0
+    return DemoData(
+        path=demo_path,
+        map_name=str(library.get("map") or ""),
+        tickrate=tickrate,
+        kills=[],
+        deaths=[],
+        rounds=[],
+        player_names=names,
+        slots=slots,
+    )
+
+
+def _sequence_from_dict(item: dict) -> Sequence | None:
+    cameras = []
+    for camera in item.get("cameras") or []:
+        if not isinstance(camera, dict):
+            continue
+        steamid = str(camera.get("steamid") or "")
+        try:
+            tick = int(camera.get("tick") or 0)
+        except (TypeError, ValueError):
+            continue
+        if steamid and tick > 0:
+            cameras.append(CameraAction(tick=tick, steamid=steamid))
+    try:
+        start = int(item.get("startTick") or 0)
+        end = int(item.get("endTick") or 0)
+        number = int(item.get("number") or 1)
+        score = float(item.get("score") or 0)
+        round_index = max(int(item.get("round") or 1) - 1, 0)
+    except (TypeError, ValueError):
+        return None
+    if not cameras or end <= start:
+        return None
+    return Sequence(
+        number=number,
+        start_tick=start,
+        end_tick=end,
+        cameras=cameras,
+        label=str(item.get("label") or ""),
+        score=score,
+        round_index=round_index,
+        filename=str(item.get("filename") or ""),
+    )
+
+
+def sequences_from_library(library: dict, selected_ids: set[str]) -> list[Sequence]:
+    """Sequences saved with the match, limited to the queued moment ids.
+
+    An empty id set keeps every saved sequence. Ids that match neither a
+    moment nor a sequence number are left for the caller to turn into clips
+    from their own tick range.
+    """
+    raw = library.get("sequences")
+    if not isinstance(raw, list):
+        return []
+    sequences: list[Sequence] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        moment_ids = {str(moment_id) for moment_id in item.get("momentIds") or []}
+        number = str(item.get("number") or "")
+        if selected_ids and not (moment_ids & selected_ids) and number not in selected_ids:
+            continue
+        sequence = _sequence_from_dict(item)
+        if sequence is not None:
+            sequences.append(sequence)
+    return sequences

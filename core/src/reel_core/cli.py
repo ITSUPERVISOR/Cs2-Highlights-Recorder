@@ -440,42 +440,69 @@ def watch(demo: Path, tick: int, player: str | None, as_json: bool) -> None:
 @click.option("--moments", "moments_file", type=click.Path(exists=True, path_type=Path), required=True)
 @click.option("--out", "out_dir", type=click.Path(path_type=Path), required=True)
 @click.option("--player", default=None)
+@click.option("--library", "library_file", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
 @click.option("--json", "as_json", is_flag=True)
-def record(demo: Path, moments_file: Path, out_dir: Path, player: str | None, as_json: bool) -> None:
+def record(
+    demo: Path,
+    moments_file: Path,
+    out_dir: Path,
+    player: str | None,
+    library_file: Path | None,
+    as_json: bool,
+) -> None:
     """Record selected moments to named MP4s via HLAE."""
     from reel_core.recording.recorder import RecordingSetupError, record as run_record, resolve_tools
-    from reel_core.serialize import load_moments_file
+    from reel_core.serialize import library_demo, load_moments_file, sequences_from_library
+    from reel_core.steamids import canonicalize_steamid
     from reel_core.video.postprocess import process_clip
 
     config = load_config()
     work_dir = _work_dir(config, demo)
     work_dir.mkdir(parents=True, exist_ok=True)
-    demo_path, parsed = _load_and_parse(demo, config)
+    demo_path = ensure_dem_file(demo, work_dir)
+
+    library: dict | None = None
+    if library_file is not None:
+        try:
+            loaded = json.loads(library_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"Could not read the saved match: {exc}") from exc
+        if isinstance(loaded, dict):
+            library = loaded
+
+    parsed = library_demo(demo_path, library) if library is not None else None
+    reused = parsed is not None
+    if parsed is None:
+        parsed = parse_demo(demo_path)
     parsed.path = demo_path
 
-    player_steamid = _resolve_cli_player(parsed, player)
-
-    _, sequences, _ = analyze(parsed, config, player_steamid)
     selected = load_moments_file(moments_file)
     ids = {
         item.get("id") or f"{item.get('steamid')}-{item.get('roundIndex', item.get('round', 1) - 1)}-{item.get('firstTick')}"
         for item in selected
         if isinstance(item, dict)
     }
-    if ids:
-        filtered = []
-        for sequence in sequences:
-            keep = any(
-                f"{m.steamid}-{m.round_index}-{m.first_tick}" in ids
-                or str(sequence.number) in ids
-                for m in sequence.moments
-            )
-            if keep:
-                filtered.append(sequence)
-        # Direct tick ranges from the UI (queued clips).
-        if not filtered:
-            filtered = _sequences_from_payload(selected, parsed, player_steamid)
-        sequences = filtered
+    if reused and library is not None:
+        sequences = sequences_from_library(library, ids)
+        if ids and not sequences:
+            fallback_player = canonicalize_steamid(player) or None
+            sequences = _sequences_from_payload(selected, parsed, fallback_player)
+    else:
+        player_steamid = _resolve_cli_player(parsed, player)
+        _, sequences, _ = analyze(parsed, config, player_steamid)
+        if ids:
+            filtered = []
+            for sequence in sequences:
+                keep = any(
+                    f"{m.steamid}-{m.round_index}-{m.first_tick}" in ids
+                    or str(sequence.number) in ids
+                    for m in sequence.moments
+                )
+                if keep:
+                    filtered.append(sequence)
+            if not filtered:
+                filtered = _sequences_from_payload(selected, parsed, player_steamid)
+            sequences = filtered
 
     if not sequences:
         raise click.ClickException("No sequences to record — check the moments file")
@@ -534,12 +561,16 @@ def preview(
                 {
                     "ok": True,
                     "cachePath": payload["cachePath"],
-                    "map": payload["map"],
-                    "frames": len(payload["frames"]),
-                    "mapSource": payload["mapSource"],
+                    "cached": bool(payload.get("cached")),
+                    "map": payload.get("map") or map_name,
+                    "frames": 0 if payload.get("cached") else len(payload["frames"]),
+                    "mapSource": payload.get("mapSource") or "",
                 }
             )
         )
+        return
+    if payload.get("cached"):
+        info(f"Preview cache {payload['cachePath']}")
         return
     info(
         f"Preview {payload['map']}  {len(payload['frames'])} frames  "
